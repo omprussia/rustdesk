@@ -1,3 +1,5 @@
+// Copyright 2024 Open Mobile Platform LLC <community@omp.ru>
+
 import 'dart:convert';
 import 'dart:io';
 
@@ -1485,22 +1487,6 @@ class _AboutState extends State<_About> {
                   SelectionArea(
                       child: Text('${translate('Fingerprint')}: $fingerprint')
                           .marginSymmetric(vertical: 4.0)),
-                  InkWell(
-                      onTap: () {
-                        launchUrlString('https://rustdesk.com/privacy.html');
-                      },
-                      child: Text(
-                        translate('Privacy Statement'),
-                        style: linkStyle,
-                      ).marginSymmetric(vertical: 4.0)),
-                  InkWell(
-                      onTap: () {
-                        launchUrlString('https://rustdesk.com');
-                      },
-                      child: Text(
-                        translate('Website'),
-                        style: linkStyle,
-                      ).marginSymmetric(vertical: 4.0)),
                   Container(
                     decoration: const BoxDecoration(color: Color(0xFF2c8cff)),
                     padding:
@@ -1512,6 +1498,10 @@ class _AboutState extends State<_About> {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
+                              Text(
+                                'Copyright ${DateTime.now().toString().substring(0, 4)} Open Mobile Platform LLC <community@omp.ru>',
+                                style: const TextStyle(color: Colors.white),
+                              ),
                               Text(
                                 'Copyright © 2023 Purslane Ltd.\n$license',
                                 style: const TextStyle(color: Colors.white),
