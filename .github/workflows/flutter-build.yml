@@ -1,3 +1,5 @@
+# Copyright 2024 Open Mobile Platform LLC <community@omp.ru>
+
 name: Build the flutter version of the RustDesk 
 
 on:
@@ -8,7 +10,7 @@ on:
         default: true
       upload-tag:
         type: string
-        default: "1.2.3-2"
+        default: "nightly"
 
 env:
   CARGO_NDK_VERSION: "3.1.2"
@@ -18,11 +20,11 @@ env:
   # for arm64 linux
   FLUTTER_ELINUX_VERSION: "3.10.6"
   FLUTTER_ELINUX_COMMIT_ID: "410b3ca42f2cd0c485edf517a1666652bab442d4"
-  TAG_NAME: "1.2.3-2"
+  TAG_NAME: "${{ inputs.upload-tag }}"
   # vcpkg version: 2023.04.15
   # for multiarch gcc compatibility
   VCPKG_COMMIT_ID: "501db0f17ef6df184fcdbfbe0f87cde2313b6ab1"
-  VERSION: "1.2.3-2"
+  VERSION: "1.2.3"
   NDK_VERSION: "r25c"
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: '${{ secrets.ANDROID_SIGNING_KEY }}'
@@ -730,7 +732,7 @@ jobs:
         id: vcpkg
         with:
           arch: ${{ matrix.job.arch }}
-          distro: ubuntu18.04
+          distro: ubuntu20.04
           # not ready yet
           # distro: ubuntu18.04-rustdesk
           githubToken: ${{ github.token }}
@@ -789,7 +791,8 @@ jobs:
           path: target/release/liblibrustdesk.so
 
   build-rustdesk-lib-linux-arm:
-    if: ${{ inputs.upload-artifact }}
+    #if: ${{ inputs.upload-artifact }}
+    if: false
     needs: [generate-bridge-linux, build-vcpkg-deps-linux]
     name: build-rust-lib ${{ matrix.job.target }} (${{ matrix.job.os }}) [${{ matrix.job.extra-build-features }}]
     runs-on: [self-hosted, Linux, ARM64]
@@ -881,7 +884,7 @@ jobs:
         id: vcpkg
         with:
           arch: ${{ matrix.job.arch }}
-          distro: ubuntu18.04-rustdesk
+          distro: ubuntu20.04-rustdesk
           githubToken: ${{ github.token }}
           setup: |
             ls -l "${PWD}"
@@ -933,7 +936,8 @@ jobs:
           path: target/release/liblibrustdesk.so
 
   build-rustdesk-sciter-arm:
-    if: ${{ inputs.upload-artifact }}
+    #if: ${{ inputs.upload-artifact }}
+    if: false
     needs: [build-vcpkg-deps-linux]
     name: build-rustdesk(sciter) ${{ matrix.job.target }} (${{ matrix.job.os }}) [${{ matrix.job.extra-build-features }}]
     runs-on: [self-hosted, Linux, ARM64]
@@ -1392,7 +1396,7 @@ jobs:
         id: vcpkg
         with:
           arch: ${{ matrix.job.arch }}
-          distro: ubuntu18.04
+          distro: ubuntu20.04
           githubToken: ${{ github.token }}
           setup: |
             ls -l "${PWD}"
@@ -1467,12 +1471,14 @@ jobs:
           path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
 
       - name: Patch archlinux PKGBUILD
-        if: ${{ matrix.job.extra-build-features == '' }}
+        #if: ${{ matrix.job.extra-build-features == '' }}
+        if: false
         run: |
           sed -i "s/arch=('x86_64')/arch=('${{ matrix.job.arch }}')/g" res/PKGBUILD
 
       - name: Build archlinux package
-        if: ${{ matrix.job.extra-build-features == '' }}
+        #if: ${{ matrix.job.extra-build-features == '' }}
+        if: false
         uses: vufa/arch-makepkg-action@master
         with:
           packages: >
@@ -1510,7 +1516,8 @@ jobs:
             cd res && HBB=`pwd`/.. FLUTTER=1 makepkg -f
 
       - name: Publish archlinux package
-        if: matrix.job.extra-build-features == '' && env.UPLOAD_ARTIFACT == 'true'
+        #if: matrix.job.extra-build-features == '' && env.UPLOAD_ARTIFACT == 'true'
+        if: false
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -1642,7 +1649,7 @@ jobs:
         id: rpm
         with:
           arch: ${{ matrix.job.arch }}
-          distro: ubuntu18.04
+          distro: ubuntu20.04
           githubToken: ${{ github.token }}
           setup: |
             ls -l "${PWD}"

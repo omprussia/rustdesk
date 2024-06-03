@@ -1,3 +1,5 @@
+# Copyright 2024 Open Mobile Platform LLC <community@omp.ru>
+
 name: Flutter Windows History Build
 
 on: [workflow_dispatch]
@@ -10,7 +12,7 @@ env:
   # vcpkg version: 2022.05.10
   # for multiarch gcc compatibility
   VCPKG_COMMIT_ID: "501db0f17ef6df184fcdbfbe0f87cde2313b6ab1"
-  VERSION: "1.2.3-2"
+  VERSION: "1.2.3"
 
 jobs:
   build-for-history-windows:
