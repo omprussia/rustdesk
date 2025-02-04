@@ -6,6 +6,7 @@ import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/consts.dart';
+import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
@@ -22,6 +23,20 @@ class TTextMenu {
       required this.onPressed,
       this.trailingIcon,
       this.divider = false});
+
+  Widget getChild() {
+    if (trailingIcon != null) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          child,
+          trailingIcon!,
+        ],
+      );
+    } else {
+      return child;
+    }
+  }
 }
 
 class TRadioMenu<T> {
@@ -115,12 +130,9 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
     );
   }
   // paste
-  if (isMobile &&
-      pi.platform != kPeerPlatformAndroid &&
-      perms['keyboard'] != false &&
-      perms['clipboard'] != false) {
+  if (pi.platform != kPeerPlatformAndroid && perms['keyboard'] != false) {
     v.add(TTextMenu(
-        child: Text(translate('Paste')),
+        child: Text(translate('Send clipboard keystrokes')),
         onPressed: () async {
           ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
           if (data != null && data.text != null) {
@@ -135,12 +147,23 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
         child: Text(translate('Reset canvas')),
         onPressed: () => ffi.cursorModel.reset()));
   }
+
+  connectWithToken(
+      {required bool isFileTransfer, required bool isTcpTunneling}) {
+    final connToken = bind.sessionGetConnToken(sessionId: ffi.sessionId);
+    connect(context, id,
+        isFileTransfer: isFileTransfer,
+        isTcpTunneling: isTcpTunneling,
+        connToken: connToken);
+  }
+
   // transferFile
   if (isDesktop) {
     v.add(
       TTextMenu(
           child: Text(translate('Transfer file')),
-          onPressed: () => connect(context, id, isFileTransfer: true)),
+          onPressed: () =>
+              connectWithToken(isFileTransfer: true, isTcpTunneling: false)),
     );
   }
   // tcpTunneling
@@ -148,7 +171,8 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
     v.add(
       TTextMenu(
           child: Text(translate('TCP tunneling')),
-          onPressed: () => connect(context, id, isTcpTunneling: true)),
+          onPressed: () =>
+              connectWithToken(isFileTransfer: false, isTcpTunneling: true)),
     );
   }
   // note
@@ -171,7 +195,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       (pi.platform == kPeerPlatformLinux || pi.sasEnabled)) {
     v.add(
       TTextMenu(
-          child: Text('${translate("Insert")} Ctrl + Alt + Del'),
+          child: Text('${translate("Insert Ctrl + Alt + Del")}'),
           onPressed: () => bind.sessionCtrlAltDel(sessionId: sessionId)),
     );
   }
@@ -583,8 +607,7 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         child: Text(translate('Lock after session end'))));
   }
 
-  if (bind.mainGetUseTextureRender() &&
-      pi.isSupportMultiDisplay &&
+  if (pi.isSupportMultiDisplay &&
       PrivacyModeState.find(id).isEmpty &&
       pi.displaysCount.value > 1 &&
       bind.mainGetUserDefaultOption(key: kKeyShowMonitorsToolbar) == 'Y') {
@@ -596,15 +619,13 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         onChanged: (value) {
           if (value == null) return;
           bind.sessionSetDisplaysAsIndividualWindows(
-              sessionId: sessionId, value: value ? 'Y' : '');
+              sessionId: sessionId, value: value ? 'Y' : 'N');
         },
         child: Text(translate('Show displays as individual windows'))));
   }
 
   final isMultiScreens = !isWeb && (await getScreenRectList()).length > 1;
-  if (bind.mainGetUseTextureRender() &&
-      pi.isSupportMultiDisplay &&
-      isMultiScreens) {
+  if (pi.isSupportMultiDisplay && isMultiScreens) {
     final value = bind.sessionGetUseAllMyDisplaysForTheRemoteSession(
             sessionId: ffi.sessionId) ==
         'Y';
@@ -613,7 +634,7 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         onChanged: (value) {
           if (value == null) return;
           bind.sessionSetUseAllMyDisplaysForTheRemoteSession(
-              sessionId: sessionId, value: value ? 'Y' : '');
+              sessionId: sessionId, value: value ? 'Y' : 'N');
         },
         child: Text(translate('Use all my displays for the remote session'))));
   }
@@ -639,6 +660,18 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
     v.addAll(toolbarKeyboardToggles(ffi));
   }
 
+  // view mode (mobile only, desktop is in keyboard menu)
+  if (isMobile && versionCmp(pi.version, '1.2.0') >= 0) {
+    v.add(TToggleMenu(
+        value: ffiModel.viewOnly,
+        onChanged: (value) async {
+          if (value == null) return;
+          await bind.sessionToggleOption(
+              sessionId: ffi.sessionId, value: kOptionToggleViewOnly);
+          ffiModel.setViewOnly(id, value);
+        },
+        child: Text(translate('View Mode'))));
+  }
   return v;
 }
 
@@ -778,4 +811,107 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
         child: Text(translate('swap-left-right-mouse'))));
   }
   return v;
+}
+
+bool showVirtualDisplayMenu(FFI ffi) {
+  if (ffi.ffiModel.pi.platform != kPeerPlatformWindows) {
+    return false;
+  }
+  if (!ffi.ffiModel.pi.isInstalled) {
+    return false;
+  }
+  if (ffi.ffiModel.pi.isRustDeskIdd || ffi.ffiModel.pi.isAmyuniIdd) {
+    return true;
+  }
+  return false;
+}
+
+List<Widget> getVirtualDisplayMenuChildren(
+    FFI ffi, String id, VoidCallback? clickCallBack) {
+  if (!showVirtualDisplayMenu(ffi)) {
+    return [];
+  }
+  final pi = ffi.ffiModel.pi;
+  final privacyModeState = PrivacyModeState.find(id);
+  if (pi.isRustDeskIdd) {
+    final virtualDisplays = ffi.ffiModel.pi.RustDeskVirtualDisplays;
+    final children = <Widget>[];
+    for (var i = 0; i < kMaxVirtualDisplayCount; i++) {
+      children.add(Obx(() => CkbMenuButton(
+            value: virtualDisplays.contains(i + 1),
+            onChanged: privacyModeState.isNotEmpty
+                ? null
+                : (bool? value) async {
+                    if (value != null) {
+                      bind.sessionToggleVirtualDisplay(
+                          sessionId: ffi.sessionId, index: i + 1, on: value);
+                      clickCallBack?.call();
+                    }
+                  },
+            child: Text('${translate('Virtual display')} ${i + 1}'),
+            ffi: ffi,
+          )));
+    }
+    children.add(Divider());
+    children.add(Obx(() => MenuButton(
+          onPressed: privacyModeState.isNotEmpty
+              ? null
+              : () {
+                  bind.sessionToggleVirtualDisplay(
+                      sessionId: ffi.sessionId,
+                      index: kAllVirtualDisplay,
+                      on: false);
+                  clickCallBack?.call();
+                },
+          ffi: ffi,
+          child: Text(translate('Plug out all')),
+        )));
+    return children;
+  }
+  if (pi.isAmyuniIdd) {
+    final count = ffi.ffiModel.pi.amyuniVirtualDisplayCount;
+    final children = <Widget>[
+      Obx(() => Row(
+            children: [
+              TextButton(
+                onPressed: privacyModeState.isNotEmpty || count == 0
+                    ? null
+                    : () {
+                        bind.sessionToggleVirtualDisplay(
+                            sessionId: ffi.sessionId, index: 0, on: false);
+                        clickCallBack?.call();
+                      },
+                child: Icon(Icons.remove),
+              ),
+              Text(count.toString()),
+              TextButton(
+                onPressed: privacyModeState.isNotEmpty || count == 4
+                    ? null
+                    : () {
+                        bind.sessionToggleVirtualDisplay(
+                            sessionId: ffi.sessionId, index: 0, on: true);
+                        clickCallBack?.call();
+                      },
+                child: Icon(Icons.add),
+              ),
+            ],
+          )),
+      Divider(),
+      Obx(() => MenuButton(
+            onPressed: privacyModeState.isNotEmpty || count == 0
+                ? null
+                : () {
+                    bind.sessionToggleVirtualDisplay(
+                        sessionId: ffi.sessionId,
+                        index: kAllVirtualDisplay,
+                        on: false);
+                    clickCallBack?.call();
+                  },
+            ffi: ffi,
+            child: Text(translate('Plug out all')),
+          )),
+    ];
+    return children;
+  }
+  return [];
 }

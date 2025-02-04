@@ -1,26 +1,25 @@
 use super::{CursorData, ResultType};
-use crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY;
 use crate::{
+    common::PORTABLE_APPNAME_RUNTIME_ENV_KEY,
     custom_server::*,
     ipc,
     privacy_mode::win_topmost_window::{self, WIN_TOPMOST_INJECTED_PROCESS_EXE},
 };
-use hbb_common::libc::{c_int, wchar_t};
 use hbb_common::{
     allow_err,
     anyhow::anyhow,
     bail,
     config::{self, Config},
+    libc::{c_int, wchar_t},
     log,
     message_proto::{DisplayInfo, Resolution, WindowsSession},
     sleep, timeout, tokio,
 };
-use std::process::{Command, Stdio};
 use std::{
     collections::HashMap,
-    ffi::OsString,
-    fs, io,
-    io::prelude::*,
+    ffi::{CString, OsString},
+    fs,
+    io::{self, prelude::*},
     mem,
     os::windows::process::CommandExt,
     path::*,
@@ -29,13 +28,16 @@ use std::{
     time::{Duration, Instant},
 };
 use wallpaper;
-use winapi::um::sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO};
 use winapi::{
     ctypes::c_void,
     shared::{minwindef::*, ntdef::NULL, windef::*, winerror::*},
     um::{
         errhandlingapi::GetLastError,
         handleapi::CloseHandle,
+        libloaderapi::{
+            GetProcAddress, LoadLibraryExA, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+            LOAD_LIBRARY_SEARCH_USER_DIRS,
+        },
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
             GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
@@ -43,12 +45,13 @@ use winapi::{
         },
         securitybaseapi::GetTokenInformation,
         shellapi::ShellExecuteW,
+        sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO},
         winbase::*,
         wingdi::*,
         winnt::{
             TokenElevation, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, TOKEN_ELEVATION,
-            TOKEN_QUERY,
+            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
+            TOKEN_ELEVATION, TOKEN_QUERY,
         },
         winreg::HKEY_CURRENT_USER,
         winuser::*,
@@ -62,10 +65,14 @@ use windows_service::{
     },
     service_control_handler::{self, ServiceControlHandlerResult},
 };
-use winreg::enums::*;
-use winreg::RegKey;
+use winreg::{enums::*, RegKey};
 
 pub const FLUTTER_RUNNER_WIN32_WINDOW_CLASS: &'static str = "FLUTTER_RUNNER_WIN32_WINDOW"; // main window, install window
+pub const EXPLORER_EXE: &'static str = "explorer.exe";
+pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
+
+const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
+const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -459,11 +466,22 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 extern "C" {
     fn get_current_session(rdp: BOOL) -> DWORD;
-    fn LaunchProcessWin(cmd: *const u16, session_id: DWORD, as_user: BOOL) -> HANDLE;
-    fn GetSessionUserTokenWin(lphUserToken: LPHANDLE, dwSessionId: DWORD, as_user: BOOL) -> BOOL;
+    fn LaunchProcessWin(
+        cmd: *const u16,
+        session_id: DWORD,
+        as_user: BOOL,
+        token_pid: &mut DWORD,
+    ) -> HANDLE;
+    fn GetSessionUserTokenWin(
+        lphUserToken: LPHANDLE,
+        dwSessionId: DWORD,
+        as_user: BOOL,
+        token_pid: &mut DWORD,
+    ) -> BOOL;
     fn selectInputDesktop() -> BOOL;
     fn inputDesktopSelected() -> BOOL;
     fn is_windows_server() -> BOOL;
+    fn is_windows_10_or_greater() -> BOOL;
     fn handleMask(
         out: *mut u8,
         mask: *const u8,
@@ -643,9 +661,13 @@ async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDL
         .chain(Some(0).into_iter())
         .collect();
     let wstr = wstr.as_ptr();
-    let h = unsafe { LaunchProcessWin(wstr, session_id, FALSE) };
+    let mut token_pid = 0;
+    let h = unsafe { LaunchProcessWin(wstr, session_id, FALSE, &mut token_pid) };
     if h.is_null() {
         log::error!("Failed to launch server: {}", io::Error::last_os_error());
+        if token_pid == 0 {
+            log::error!("No process winlogon.exe");
+        }
     }
     Ok(h)
 }
@@ -665,8 +687,17 @@ pub fn run_as_user(arg: Vec<&str>) -> ResultType<Option<std::process::Child>> {
         .chain(Some(0).into_iter())
         .collect();
     let wstr = wstr.as_ptr();
-    let h = unsafe { LaunchProcessWin(wstr, session_id, TRUE) };
+    let mut token_pid = 0;
+    let h = unsafe { LaunchProcessWin(wstr, session_id, TRUE, &mut token_pid) };
     if h.is_null() {
+        if token_pid == 0 {
+            bail!(
+                "Failed to launch {:?} with session id {}: no process {}",
+                arg,
+                session_id,
+                EXPLORER_EXE
+            );
+        }
         bail!(
             "Failed to launch {:?} with session id {}: {}",
             arg,
@@ -810,12 +841,12 @@ fn get_current_session_username() -> Option<String> {
 
 fn get_session_username(session_id: u32) -> String {
     extern "C" {
-        fn get_session_user_info(path: *mut u16, n: u32, rdp: bool, session_id: u32) -> u32;
+        fn get_session_user_info(path: *mut u16, n: u32, session_id: u32) -> u32;
     }
     let buff_size = 256;
     let mut buff: Vec<u16> = Vec::with_capacity(buff_size);
     buff.resize(buff_size, 0);
-    let n = unsafe { get_session_user_info(buff.as_mut_ptr(), buff_size as _, true, session_id) };
+    let n = unsafe { get_session_user_info(buff.as_mut_ptr(), buff_size as _, session_id) };
     if n == 0 {
         return "".to_owned();
     }
@@ -966,6 +997,32 @@ fn get_valid_subkey() -> String {
     return get_subkey(&app_name, false);
 }
 
+// Return install options other than InstallLocation.
+pub fn get_install_options() -> String {
+    let app_name = crate::get_app_name();
+    let subkey = format!(".{}", app_name.to_lowercase());
+    let mut opts = HashMap::new();
+
+    let desktop_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_DESKTOPSHORTCUTS);
+    if let Some(desktop_shortcuts) = desktop_shortcuts {
+        opts.insert(REG_NAME_INSTALL_DESKTOPSHORTCUTS, desktop_shortcuts);
+    }
+    let start_menu_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_STARTMENUSHORTCUTS);
+    if let Some(start_menu_shortcuts) = start_menu_shortcuts {
+        opts.insert(REG_NAME_INSTALL_STARTMENUSHORTCUTS, start_menu_shortcuts);
+    }
+    serde_json::to_string(&opts).unwrap_or("{}".to_owned())
+}
+
+// This function return Option<String>, because some registry value may be empty.
+fn get_reg_of_hkcr(subkey: &str, name: &str) -> Option<String> {
+    let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
+    if let Ok(tmp) = hkcr.open_subkey(subkey.replace("HKEY_CLASSES_ROOT\\", "")) {
+        return tmp.get_value(name).ok();
+    }
+    None
+}
+
 pub fn get_install_info() -> (String, String, String, String) {
     get_install_info_with_subkey(get_valid_subkey())
 }
@@ -1075,7 +1132,11 @@ pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> 
     ))
 }
 
-fn get_after_install(exe: &str) -> String {
+fn get_after_install(
+    exe: &str,
+    reg_value_start_menu_shortcuts: Option<String>,
+    reg_value_desktop_shortcuts: Option<String>,
+) -> String {
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
 
@@ -1086,9 +1147,24 @@ fn get_after_install(exe: &str) -> String {
     hcu.delete_subkey_all(format!("Software\\Classes\\{}", exe))
         .ok();
 
+    let desktop_shortcuts = reg_value_desktop_shortcuts
+        .map(|v| {
+            format!("reg add HKEY_CLASSES_ROOT\\.{ext} /f /v {REG_NAME_INSTALL_DESKTOPSHORTCUTS} /t REG_SZ /d \"{v}\"")
+        })
+        .unwrap_or_default();
+    let start_menu_shortcuts = reg_value_start_menu_shortcuts
+        .map(|v| {
+            format!(
+                "reg add HKEY_CLASSES_ROOT\\.{ext} /f /v {REG_NAME_INSTALL_STARTMENUSHORTCUTS} /t REG_SZ /d \"{v}\""
+            )
+        })
+        .unwrap_or_default();
+
     format!("
     chcp 65001
     reg add HKEY_CLASSES_ROOT\\.{ext} /f
+    {desktop_shortcuts}
+    {start_menu_shortcuts}
     reg add HKEY_CLASSES_ROOT\\.{ext}\\DefaultIcon /f
     reg add HKEY_CLASSES_ROOT\\.{ext}\\DefaultIcon /f /ve /t REG_SZ  /d \"\\\"{exe}\\\",0\"
     reg add HKEY_CLASSES_ROOT\\.{ext}\\shell /f
@@ -1171,6 +1247,8 @@ oLink.Save
     .unwrap_or("")
     .to_owned();
     let tray_shortcut = get_tray_shortcut(&exe, &tmp_path)?;
+    let mut reg_value_desktop_shortcuts = "0".to_owned();
+    let mut reg_value_start_menu_shortcuts = "0".to_owned();
     let mut shortcuts = Default::default();
     if options.contains("desktopicon") {
         shortcuts = format!(
@@ -1178,6 +1256,7 @@ oLink.Save
             tmp_path,
             crate::get_app_name()
         );
+        reg_value_desktop_shortcuts = "1".to_owned();
     }
     if options.contains("startmenu") {
         shortcuts = format!(
@@ -1187,6 +1266,7 @@ copy /Y \"{tmp_path}\\{app_name}.lnk\" \"{start_menu}\\\"
 copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
      "
         );
+        reg_value_start_menu_shortcuts = "1".to_owned();
     }
 
     let meta = std::fs::symlink_metadata(std::env::current_exe()?)?;
@@ -1255,7 +1335,11 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
     ",
         version = crate::VERSION.replace("-", "."),
         build_date = crate::BUILD_DATE,
-        after_install = get_after_install(&exe),
+        after_install = get_after_install(
+            &exe,
+            Some(reg_value_start_menu_shortcuts),
+            Some(reg_value_desktop_shortcuts)
+        ),
         sleep = if debug { "timeout 300" } else { "" },
         dels = if debug { "" } else { &dels },
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
@@ -1268,7 +1352,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 
 pub fn run_after_install() -> ResultType<()> {
     let (_, _, _, exe) = get_install_info();
-    run_cmds(get_after_install(&exe), true, "after_install")
+    run_cmds(get_after_install(&exe, None, None), true, "after_install")
 }
 
 pub fn run_before_uninstall() -> ResultType<()> {
@@ -1378,15 +1462,13 @@ fn to_le(v: &mut [u16]) -> &[u8] {
     unsafe { v.align_to().1 }
 }
 
-fn get_undone_file(tmp: &PathBuf) -> ResultType<PathBuf> {
-    let mut tmp1 = tmp.clone();
-    tmp1.set_file_name(format!(
+fn get_undone_file(tmp: &Path) -> ResultType<PathBuf> {
+    Ok(tmp.with_file_name(format!(
         "{}.undone",
         tmp.file_name()
             .ok_or(anyhow!("Failed to get filename of {:?}", tmp))?
             .to_string_lossy()
-    ));
-    Ok(tmp1)
+    )))
 }
 
 fn run_cmds(cmds: String, show: bool, tip: &str) -> ResultType<()> {
@@ -1478,10 +1560,68 @@ pub fn is_win_server() -> bool {
     unsafe { is_windows_server() > 0 }
 }
 
-pub fn bootstrap() {
+#[inline]
+pub fn is_win_10_or_greater() -> bool {
+    unsafe { is_windows_10_or_greater() > 0 }
+}
+
+pub fn bootstrap() -> bool {
     if let Ok(lic) = get_license_from_exe_name() {
         *config::EXE_RENDEZVOUS_SERVER.write().unwrap() = lic.host.clone();
     }
+
+    set_safe_load_dll()
+}
+
+fn set_safe_load_dll() -> bool {
+    if !unsafe { set_default_dll_directories() } {
+        return false;
+    }
+
+    // `SetDllDirectoryW` should never fail.
+    // https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setdlldirectoryw
+    if unsafe { SetDllDirectoryW(wide_string("").as_ptr()) == FALSE } {
+        eprintln!("SetDllDirectoryW failed: {}", io::Error::last_os_error());
+        return false;
+    }
+
+    true
+}
+
+// https://docs.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-setdefaultdlldirectories
+unsafe fn set_default_dll_directories() -> bool {
+    let module = LoadLibraryExW(
+        wide_string("Kernel32.dll").as_ptr(),
+        0 as _,
+        LOAD_LIBRARY_SEARCH_SYSTEM32,
+    );
+    if module.is_null() {
+        return false;
+    }
+
+    match CString::new("SetDefaultDllDirectories") {
+        Err(e) => {
+            eprintln!("CString::new failed: {}", e);
+            return false;
+        }
+        Ok(func_name) => {
+            let func = GetProcAddress(module, func_name.as_ptr());
+            if func.is_null() {
+                eprintln!("GetProcAddress failed: {}", io::Error::last_os_error());
+                return false;
+            }
+            type SetDefaultDllDirectories = unsafe extern "system" fn(DWORD) -> BOOL;
+            let func: SetDefaultDllDirectories = std::mem::transmute(func);
+            if func(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS) == FALSE {
+                eprintln!(
+                    "SetDefaultDllDirectories failed: {}",
+                    io::Error::last_os_error()
+                );
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub fn create_shortcut(id: &str) -> ResultType<()> {
@@ -1540,11 +1680,13 @@ pub fn quit_gui() {
 pub fn get_user_token(session_id: u32, as_user: bool) -> HANDLE {
     let mut token = NULL as HANDLE;
     unsafe {
+        let mut _token_pid = 0;
         if FALSE
             == GetSessionUserTokenWin(
                 &mut token as _,
                 session_id,
                 if as_user { TRUE } else { FALSE },
+                &mut _token_pid,
             )
         {
             NULL as _
@@ -1844,7 +1986,7 @@ pub fn create_process_with_logon(user: &str, pwd: &str, exe: &str, arg: &str) ->
     return Ok(());
 }
 
-pub fn set_path_permission(dir: &PathBuf, permission: &str) -> ResultType<()> {
+pub fn set_path_permission(dir: &Path, permission: &str) -> ResultType<()> {
     std::process::Command::new("icacls")
         .arg(dir.as_os_str())
         .arg("/grant")
@@ -2000,7 +2142,7 @@ pub fn get_unicode_from_vk(vk: u32) -> Option<u16> {
         let current_window_thread_id = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
         let layout = GetKeyboardLayout(current_window_thread_id);
 
-        // refs: https://github.com/fufesou/rdev/blob/25a99ce71ab42843ad253dd51e6a35e83e87a8a4/src/windows/keyboard.rs#L115
+        // refs: https://github.com/rustdesk-org/rdev/blob/25a99ce71ab42843ad253dd51e6a35e83e87a8a4/src/windows/keyboard.rs#L115
         let press_state = 129;
         let mut state: [BYTE; 256] = [0; 256];
         let shift_left = rdev::get_modifier(rdev::Key::ShiftLeft);
@@ -2030,6 +2172,7 @@ pub fn is_process_consent_running() -> ResultType<bool> {
         .output()?;
     Ok(output.status.success() && !output.stdout.is_empty())
 }
+
 pub struct WakeLock(u32);
 // Failed to compile keepawake-rs on i686
 impl WakeLock {
@@ -2185,12 +2328,10 @@ sc start {app_name}
 
 fn run_after_run_cmds(silent: bool) {
     let (_, _, _, exe) = get_install_info();
-    let app = crate::get_app_name().to_lowercase();
     if !silent {
         log::debug!("Spawn new window");
         allow_err!(std::process::Command::new("cmd")
-            .arg("/c")
-            .arg(format!("timeout /t 2 & start {app}://"))
+            .args(&["/c", "timeout", "/t", "2", "&", &format!("{exe}")])
             .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
             .spawn());
     }
@@ -2288,34 +2429,6 @@ fn get_license() -> Option<CustomServer> {
     Some(lic)
 }
 
-fn get_sid_of_user(username: &str) -> ResultType<String> {
-    let mut output = Command::new("wmic")
-        .args(&[
-            "useraccount",
-            "where",
-            &format!("name='{}'", username),
-            "get",
-            "sid",
-            "/value",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::piped())
-        .spawn()?
-        .stdout
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to open stdout"))?;
-    let mut result = String::new();
-    output.read_to_string(&mut result)?;
-    let sid_start_index = result
-        .find('=')
-        .map(|i| i + 1)
-        .ok_or(anyhow!("bad output format"))?;
-    if sid_start_index > 0 && sid_start_index < result.len() + 1 {
-        Ok(result[sid_start_index..].trim().to_string())
-    } else {
-        bail!("bad output format");
-    }
-}
-
 pub struct WallPaperRemover {
     old_path: String,
 }
@@ -2351,12 +2464,7 @@ impl WallPaperRemover {
         // https://www.makeuseof.com/find-desktop-wallpapers-file-location-windows-11/
         // https://superuser.com/questions/1218413/write-to-current-users-registry-through-a-different-admin-account
         let (hkcu, sid) = if is_root() {
-            let username = get_active_username();
-            if username.is_empty() {
-                bail!("failed to get username");
-            }
-            let sid = get_sid_of_user(&username)?;
-            log::info!("username: {username}, sid: {sid}");
+            let sid = get_current_process_session_id().ok_or(anyhow!("failed to get sid"))?;
             (RegKey::predef(HKEY_USERS), format!("{}\\", sid))
         } else {
             (RegKey::predef(HKEY_CURRENT_USER), "".to_string())
@@ -2422,36 +2530,201 @@ pub fn is_x64() -> bool {
     unsafe { sys_info.u.s().wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 }
 }
 
-#[cfg(feature = "flutter")]
-pub fn try_kill_flutter_main_window_process() {
-    // It's called when --server failed to start ipc, because the ipc may be occupied by the main window process.
-    // When --service quit the ipc process, ipc process will call std::process::exit, std::process::exit not work may be the reason.
-    // FindWindow not work in --service, https://forums.codeguru.com/showthread.php?169091-FindWindow-in-service
-    log::info!("try kill flutter main window process");
+pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
+    // Kill rustdesk.exe without extra arg, should only be called by --server
+    // We can find the exact process which occupies the ipc, see more from https://github.com/winsiderss/systeminformer
+    log::info!("try kill rustdesk main window process");
+    use hbb_common::sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes();
+    let my_uid = sys
+        .process((std::process::id() as usize).into())
+        .map(|x| x.user_id())
+        .unwrap_or_default();
+    let my_pid = std::process::id();
+    let app_name = crate::get_app_name().to_lowercase();
+    if app_name.is_empty() {
+        bail!("app name is empty");
+    }
+    for (_, p) in sys.processes().iter() {
+        let p_name = p.name().to_lowercase();
+        // name equal
+        if !(p_name == app_name || p_name == app_name.clone() + ".exe") {
+            continue;
+        }
+        // arg more than 1
+        if p.cmd().len() < 1 {
+            continue;
+        }
+        // first arg contain app name
+        if !p.cmd()[0].to_lowercase().contains(&p_name) {
+            continue;
+        }
+        // only one arg or the second arg is empty uni link
+        let is_empty_uni = p.cmd().len() == 2 && crate::common::is_empty_uni_link(&p.cmd()[1]);
+        if !(p.cmd().len() == 1 || is_empty_uni) {
+            continue;
+        }
+        // skip self
+        if p.pid().as_u32() == my_pid {
+            continue;
+        }
+        // because we call it with --server, so we can check user_id, remove this if call it with user process
+        if p.user_id() == my_uid {
+            log::info!("user id equal, continue");
+            continue;
+        }
+        log::info!("try kill process: {:?}, pid = {:?}", p.cmd(), p.pid());
+        nt_terminate_process(p.pid().as_u32())?;
+        log::info!("kill process success: {:?}, pid = {:?}", p.cmd(), p.pid());
+        return Ok(());
+    }
+    bail!("failed to find rustdesk main window process");
+}
+
+fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
+    type NtTerminateProcess = unsafe extern "system" fn(HANDLE, DWORD) -> DWORD;
     unsafe {
-        let window_name = wide_string(&crate::get_app_name());
-        let class_name = wide_string(FLUTTER_RUNNER_WIN32_WINDOW_CLASS);
-        let hwnd = FindWindowW(class_name.as_ptr(), window_name.as_ptr());
-        if hwnd.is_null() {
-            log::info!("not found flutter main window");
-            return;
-        }
-        let mut process_id: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut process_id as *mut u32);
-        if process_id == 0 {
-            log::info!("failed to get flutter window process id");
-            return;
-        }
-        let output = Command::new("taskkill")
-            .arg("/F")
-            .arg("/PID")
-            .arg(process_id.to_string())
-            .output()
-            .expect("Failed to execute command");
-        if output.status.success() {
-            log::info!("kill flutter main window process success");
+        let h_module = LoadLibraryExA(
+            CString::new("ntdll.dll")?.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+        if !h_module.is_null() {
+            let f_nt_terminate_process: NtTerminateProcess = std::mem::transmute(GetProcAddress(
+                h_module,
+                CString::new("NtTerminateProcess")?.as_ptr(),
+            ));
+            let h_token = OpenProcess(PROCESS_ALL_ACCESS, 0, process_id);
+            if !h_token.is_null() {
+                if f_nt_terminate_process(h_token, 1) == 0 {
+                    log::info!("terminate process {} success", process_id);
+                    CloseHandle(h_token);
+                    return Ok(());
+                } else {
+                    CloseHandle(h_token);
+                    bail!("NtTerminateProcess {} failed", process_id);
+                }
+            } else {
+                bail!("OpenProcess {} failed", process_id);
+            }
         } else {
-            log::error!("kill flutter main window process failed");
+            bail!("Failed to load ntdll.dll");
+        }
+    }
+}
+
+pub fn try_set_window_foreground(window: HWND) {
+    let env_key = SET_FOREGROUND_WINDOW;
+    if let Ok(value) = std::env::var(env_key) {
+        if value == "1" {
+            unsafe {
+                SetForegroundWindow(window);
+            }
+            std::env::remove_var(env_key);
+        }
+    }
+}
+
+pub mod reg_display_settings {
+    use hbb_common::ResultType;
+    use serde_derive::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use winreg::{enums::*, RegValue};
+    const REG_GRAPHICS_DRIVERS_PATH: &str = "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers";
+    const REG_CONNECTIVITY_PATH: &str = "Connectivity";
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct RegRecovery {
+        path: String,
+        key: String,
+        old: (Vec<u8>, isize),
+        new: (Vec<u8>, isize),
+    }
+
+    pub fn read_reg_connectivity() -> ResultType<HashMap<String, HashMap<String, RegValue>>> {
+        let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
+        let reg_connectivity = hklm.open_subkey_with_flags(
+            format!("{}\\{}", REG_GRAPHICS_DRIVERS_PATH, REG_CONNECTIVITY_PATH),
+            KEY_READ,
+        )?;
+
+        let mut map_connectivity = HashMap::new();
+        for key in reg_connectivity.enum_keys() {
+            let key = key?;
+            let mut map_item = HashMap::new();
+            let reg_item = reg_connectivity.open_subkey_with_flags(&key, KEY_READ)?;
+            for value in reg_item.enum_values() {
+                let (name, value) = value?;
+                map_item.insert(name, value);
+            }
+            map_connectivity.insert(key, map_item);
+        }
+        Ok(map_connectivity)
+    }
+
+    pub fn diff_recent_connectivity(
+        map1: HashMap<String, HashMap<String, RegValue>>,
+        map2: HashMap<String, HashMap<String, RegValue>>,
+    ) -> Option<RegRecovery> {
+        for (subkey, map_item2) in map2 {
+            if let Some(map_item1) = map1.get(&subkey) {
+                let key = "Recent";
+                if let Some(value1) = map_item1.get(key) {
+                    if let Some(value2) = map_item2.get(key) {
+                        if value1 != value2 {
+                            return Some(RegRecovery {
+                                path: format!(
+                                    "{}\\{}\\{}",
+                                    REG_GRAPHICS_DRIVERS_PATH, REG_CONNECTIVITY_PATH, subkey
+                                ),
+                                key: key.to_owned(),
+                                old: (value1.bytes.clone(), value1.vtype.clone() as isize),
+                                new: (value2.bytes.clone(), value2.vtype.clone() as isize),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn restore_reg_connectivity(reg_recovery: RegRecovery) -> ResultType<()> {
+        let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
+        let reg_item = hklm.open_subkey_with_flags(&reg_recovery.path, KEY_READ | KEY_WRITE)?;
+        let cur_reg_value = reg_item.get_raw_value(&reg_recovery.key)?;
+        let new_reg_value = RegValue {
+            bytes: reg_recovery.new.0,
+            vtype: isize_to_reg_type(reg_recovery.new.1),
+        };
+        if cur_reg_value != new_reg_value {
+            return Ok(());
+        }
+        let reg_value = RegValue {
+            bytes: reg_recovery.old.0,
+            vtype: isize_to_reg_type(reg_recovery.old.1),
+        };
+        reg_item.set_raw_value(&reg_recovery.key, &reg_value)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn isize_to_reg_type(i: isize) -> RegType {
+        match i {
+            0 => RegType::REG_NONE,
+            1 => RegType::REG_SZ,
+            2 => RegType::REG_EXPAND_SZ,
+            3 => RegType::REG_BINARY,
+            4 => RegType::REG_DWORD,
+            5 => RegType::REG_DWORD_BIG_ENDIAN,
+            6 => RegType::REG_LINK,
+            7 => RegType::REG_MULTI_SZ,
+            8 => RegType::REG_RESOURCE_LIST,
+            9 => RegType::REG_FULL_RESOURCE_DESCRIPTOR,
+            10 => RegType::REG_RESOURCE_REQUIREMENTS_LIST,
+            11 => RegType::REG_QWORD,
+            _ => RegType::REG_NONE,
         }
     }
 }

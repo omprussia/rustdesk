@@ -6,6 +6,7 @@ import 'package:bot_toast/bot_toast.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/common/widgets/overlay.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/pages/install_page.dart';
 import 'package:flutter_hbb/desktop/pages/server_page.dart';
@@ -35,6 +36,7 @@ WindowType? kWindowType;
 late List<String> kBootArgs;
 
 Future<void> main(List<String> args) async {
+  earlyAssert();
   WidgetsFlutterBinding.ensureInitialized();
 
   debugPrint("launch args: $args");
@@ -95,6 +97,9 @@ Future<void> main(List<String> args) async {
     desktopType = DesktopType.main;
     await windowManager.ensureInitialized();
     windowManager.setPreventClose(true);
+    if (isMacOS) {
+      disableWindowMovable(kWindowId);
+    }
     runMainApp(true);
   }
 }
@@ -115,6 +120,7 @@ Future<void> initEnv(String appType) async {
 void runMainApp(bool startService) async {
   // register uni links
   await initEnv(kAppTypeMain);
+  checkUpdate();
   // trigger connection status updater
   await bind.mainCheckConnectStatus();
   if (startService) {
@@ -151,12 +157,14 @@ void runMainApp(bool startService) async {
 
 void runMobileApp() async {
   await initEnv(kAppTypeMain);
+  checkUpdate();
   if (isAndroid) androidChannelInit();
   if (isAndroid) platformFFI.syncAndroidServiceAppDirConfigPath();
+  draggablePositions.load();
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();
   runApp(App());
-  if (!isWeb) await initUniLinks();
+  await initUniLinks();
 }
 
 void runMultiWindow(
@@ -167,9 +175,13 @@ void runMultiWindow(
   final title = getWindowName();
   // set prevent close to true, we handle close event manually
   WindowController.fromWindowId(kWindowId!).setPreventClose(true);
+  if (isMacOS) {
+    disableWindowMovable(kWindowId);
+  }
   late Widget widget;
   switch (appType) {
     case kAppTypeDesktopRemote:
+      draggablePositions.load();
       widget = DesktopRemoteScreen(
         params: argument,
       );
@@ -251,7 +263,7 @@ showCmWindow({bool isStartup = false}) async {
     WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
         size: kConnectionManagerWindowSizeClosedChat, alwaysOnTop: true);
     await windowManager.waitUntilReadyToShow(windowOptions, null);
-    bind.mainHideDocker();
+    bind.mainHideDock();
     await Future.wait([
       windowManager.show(),
       windowManager.focus(),
@@ -279,14 +291,14 @@ hideCmWindow({bool isStartup = false}) async {
         size: kConnectionManagerWindowSizeClosedChat);
     windowManager.setOpacity(0);
     await windowManager.waitUntilReadyToShow(windowOptions, null);
-    bind.mainHideDocker();
+    bind.mainHideDock();
     await windowManager.minimize();
     await windowManager.hide();
     _isCmReadyToShow = true;
   } else if (_isCmReadyToShow) {
     if (await windowManager.getOpacity() != 0) {
       await windowManager.setOpacity(0);
-      bind.mainHideDocker();
+      bind.mainHideDock();
       await windowManager.minimize();
       await windowManager.hide();
     }
@@ -338,7 +350,6 @@ void runInstallPage() async {
     windowManager.focus();
     windowManager.setOpacity(1);
     windowManager.setAlignment(Alignment.center); // ensure
-    windowManager.setTitle(getWindowName());
   });
 }
 
@@ -364,7 +375,7 @@ class App extends StatefulWidget {
   State<App> createState() => _AppState();
 }
 
-class _AppState extends State<App> {
+class _AppState extends State<App> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
@@ -388,6 +399,34 @@ class _AppState extends State<App> {
         bind.mainChangeTheme(dark: to.toShortString());
       }
     };
+    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _updateOrientation());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeMetrics() {
+    _updateOrientation();
+  }
+
+  void _updateOrientation() {
+    if (isDesktop) return;
+
+    // Don't use `MediaQuery.of(context).orientation` in `didChangeMetrics()`,
+    // my test (Flutter 3.19.6, Android 14) is always the reverse value.
+    // https://github.com/flutter/flutter/issues/60899
+    // stateGlobal.isPortrait.value =
+    //     MediaQuery.of(context).orientation == Orientation.portrait;
+
+    final orientation = View.of(context).physicalSize.aspectRatio > 1
+        ? Orientation.landscape
+        : Orientation.portrait;
+    stateGlobal.isPortrait.value = orientation == Orientation.portrait;
   }
 
   @override
@@ -408,7 +447,9 @@ class _AppState extends State<App> {
         child: GetMaterialApp(
           navigatorKey: globalKey,
           debugShowCheckedModeBanner: false,
-          title: 'RustDesk',
+          title: isWeb
+              ? '${bind.mainGetAppNameSync()} Web Client V2 (Preview)'
+              : bind.mainGetAppNameSync(),
           theme: MyTheme.lightTheme,
           darkTheme: MyTheme.darkTheme,
           themeMode: MyTheme.currentThemeMode(),
@@ -439,7 +480,8 @@ class _AppState extends State<App> {
               : (context, child) {
                   child = _keepScaleBuilder(context, child);
                   child = botToastBuilder(context, child);
-                  if (isDesktop && desktopType == DesktopType.main) {
+                  if ((isDesktop && desktopType == DesktopType.main) ||
+                      isWebDesktop) {
                     child = keyListenerBuilder(context, child);
                   }
                   if (isLinux) {
@@ -467,7 +509,7 @@ _registerEventHandler() {
     platformFFI.registerEventHandler('theme', 'theme', (evt) async {
       String? dark = evt['dark'];
       if (dark != null) {
-        MyTheme.changeDarkMode(MyTheme.themeModeFromString(dark));
+        await MyTheme.changeDarkMode(MyTheme.themeModeFromString(dark));
       }
     });
     platformFFI.registerEventHandler('language', 'language', (_) async {

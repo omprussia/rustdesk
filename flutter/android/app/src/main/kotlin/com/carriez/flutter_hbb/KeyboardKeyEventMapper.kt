@@ -31,7 +31,7 @@ object KeyEventConverter {
         }
 
         var action = 0
-        if (keyEventProto.getDown()) {
+        if (keyEventProto.getDown() || keyEventProto.getPress()) {
             action = KeyEvent.ACTION_DOWN
         } else {
             action = KeyEvent.ACTION_UP
@@ -112,6 +112,10 @@ object KeyEventConverter {
             ControlKey.Delete -> KeyEvent.KEYCODE_FORWARD_DEL
             ControlKey.Clear -> KeyEvent.KEYCODE_CLEAR
             ControlKey.Pause -> KeyEvent.KEYCODE_BREAK
+            ControlKey.VolumeMute -> KeyEvent.KEYCODE_VOLUME_MUTE
+            ControlKey.VolumeUp -> KeyEvent.KEYCODE_VOLUME_UP
+            ControlKey.VolumeDown -> KeyEvent.KEYCODE_VOLUME_DOWN
+            ControlKey.Power -> KeyEvent.KEYCODE_POWER
             else -> 0 // Default to unknown.
         }
     }

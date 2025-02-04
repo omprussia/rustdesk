@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
+import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
+import 'package:flutter_hbb/models/state_model.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:settings_ui/settings_ui.dart';
@@ -35,10 +38,42 @@ class SettingsPage extends StatefulWidget implements PageShape {
 
 const url = 'https://rustdesk.com/';
 
+enum KeepScreenOn {
+  never,
+  duringControlled,
+  serviceOn,
+}
+
+String _keepScreenOnToOption(KeepScreenOn value) {
+  switch (value) {
+    case KeepScreenOn.never:
+      return 'never';
+    case KeepScreenOn.duringControlled:
+      return 'during-controlled';
+    case KeepScreenOn.serviceOn:
+      return 'service-on';
+  }
+}
+
+KeepScreenOn optionToKeepScreenOn(String value) {
+  switch (value) {
+    case 'never':
+      return KeepScreenOn.never;
+    case 'service-on':
+      return KeepScreenOn.serviceOn;
+    default:
+      return KeepScreenOn.duringControlled;
+  }
+}
+
 class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
-  final _hasIgnoreBattery = androidVersion >= 26;
+  final _hasIgnoreBattery =
+      false; //androidVersion >= 26; // remove because not work on every device
   var _ignoreBatteryOpt = false;
   var _enableStartOnBoot = false;
+  var _checkUpdateOnStartup = false;
+  var _floatingWindowDisabled = false;
+  var _keepScreenOn = KeepScreenOn.duringControlled; // relay on floating window
   var _enableAbr = false;
   var _denyLANDiscovery = false;
   var _onlyWhiteList = false;
@@ -46,19 +81,54 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _enableRecordSession = false;
   var _enableHardwareCodec = false;
   var _autoRecordIncomingSession = false;
+  var _autoRecordOutgoingSession = false;
   var _allowAutoDisconnect = false;
   var _localIP = "";
   var _directAccessPort = "";
   var _fingerprint = "";
   var _buildDate = "";
   var _autoDisconnectTimeout = "";
+  var _hideServer = false;
+  var _hideProxy = false;
+  var _hideNetwork = false;
+  var _enableTrustedDevices = false;
+
+  _SettingsState() {
+    _enableAbr = option2bool(
+        kOptionEnableAbr, bind.mainGetOptionSync(key: kOptionEnableAbr));
+    _denyLANDiscovery = !option2bool(kOptionEnableLanDiscovery,
+        bind.mainGetOptionSync(key: kOptionEnableLanDiscovery));
+    _onlyWhiteList = whitelistNotEmpty();
+    _enableDirectIPAccess = option2bool(
+        kOptionDirectServer, bind.mainGetOptionSync(key: kOptionDirectServer));
+    _enableRecordSession = option2bool(kOptionEnableRecordSession,
+        bind.mainGetOptionSync(key: kOptionEnableRecordSession));
+    _enableHardwareCodec = option2bool(kOptionEnableHwcodec,
+        bind.mainGetOptionSync(key: kOptionEnableHwcodec));
+    _autoRecordIncomingSession = option2bool(kOptionAllowAutoRecordIncoming,
+        bind.mainGetOptionSync(key: kOptionAllowAutoRecordIncoming));
+    _autoRecordOutgoingSession = option2bool(kOptionAllowAutoRecordOutgoing,
+        bind.mainGetLocalOption(key: kOptionAllowAutoRecordOutgoing));
+    _localIP = bind.mainGetOptionSync(key: 'local-ip-addr');
+    _directAccessPort = bind.mainGetOptionSync(key: kOptionDirectAccessPort);
+    _allowAutoDisconnect = option2bool(kOptionAllowAutoDisconnect,
+        bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
+    _autoDisconnectTimeout =
+        bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
+    _hideServer =
+        bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
+    _hideProxy = bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
+    _hideNetwork =
+        bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) == 'Y';
+    _enableTrustedDevices = mainGetBoolOptionSync(kOptionEnableTrustedDevices);
+  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    () async {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       var update = false;
 
       if (_hasIgnoreBattery) {
@@ -86,67 +156,28 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         _enableStartOnBoot = enableStartOnBoot;
       }
 
-      final enableAbrRes = option2bool(
-          kOptionEnableAbr, await bind.mainGetOption(key: kOptionEnableAbr));
-      if (enableAbrRes != _enableAbr) {
+      var checkUpdateOnStartup =
+          mainGetLocalBoolOptionSync(kOptionEnableCheckUpdate);
+      if (checkUpdateOnStartup != _checkUpdateOnStartup) {
         update = true;
-        _enableAbr = enableAbrRes;
+        _checkUpdateOnStartup = checkUpdateOnStartup;
       }
 
-      final denyLanDiscovery = !option2bool('enable-lan-discovery',
-          await bind.mainGetOption(key: 'enable-lan-discovery'));
-      if (denyLanDiscovery != _denyLANDiscovery) {
+      var floatingWindowDisabled =
+          bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
+              !await AndroidPermissionManager.check(kSystemAlertWindow);
+      if (floatingWindowDisabled != _floatingWindowDisabled) {
         update = true;
-        _denyLANDiscovery = denyLanDiscovery;
+        _floatingWindowDisabled = floatingWindowDisabled;
       }
 
-      final onlyWhiteList = (await bind.mainGetOption(key: kOptionWhitelist)) !=
-          defaultOptionWhitelist;
-      if (onlyWhiteList != _onlyWhiteList) {
+      final keepScreenOn = _floatingWindowDisabled
+          ? KeepScreenOn.never
+          : optionToKeepScreenOn(
+              bind.mainGetLocalOption(key: kOptionKeepScreenOn));
+      if (keepScreenOn != _keepScreenOn) {
         update = true;
-        _onlyWhiteList = onlyWhiteList;
-      }
-
-      final enableDirectIPAccess = option2bool(kOptionDirectServer,
-          await bind.mainGetOption(key: kOptionDirectServer));
-      if (enableDirectIPAccess != _enableDirectIPAccess) {
-        update = true;
-        _enableDirectIPAccess = enableDirectIPAccess;
-      }
-
-      final enableRecordSession = option2bool(kOptionEnableRecordSession,
-          await bind.mainGetOption(key: kOptionEnableRecordSession));
-      if (enableRecordSession != _enableRecordSession) {
-        update = true;
-        _enableRecordSession = enableRecordSession;
-      }
-
-      final enableHardwareCodec = option2bool(kOptionEnableHwcodec,
-          await bind.mainGetOption(key: kOptionEnableHwcodec));
-      if (_enableHardwareCodec != enableHardwareCodec) {
-        update = true;
-        _enableHardwareCodec = enableHardwareCodec;
-      }
-
-      final autoRecordIncomingSession = option2bool(
-          kOptionAllowAutoRecordIncoming,
-          await bind.mainGetOption(key: kOptionAllowAutoRecordIncoming));
-      if (autoRecordIncomingSession != _autoRecordIncomingSession) {
-        update = true;
-        _autoRecordIncomingSession = autoRecordIncomingSession;
-      }
-
-      final localIP = await bind.mainGetOption(key: 'local-ip-addr');
-      if (localIP != _localIP) {
-        update = true;
-        _localIP = localIP;
-      }
-
-      final directAccessPort =
-          await bind.mainGetOption(key: kOptionDirectAccessPort);
-      if (directAccessPort != _directAccessPort) {
-        update = true;
-        _directAccessPort = directAccessPort;
+        _keepScreenOn = keepScreenOn;
       }
 
       final fingerprint = await bind.mainGetFingerprint();
@@ -160,25 +191,10 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         update = true;
         _buildDate = buildDate;
       }
-
-      final allowAutoDisconnect = option2bool(kOptionAllowAutoDisconnect,
-          await bind.mainGetOption(key: kOptionAllowAutoDisconnect));
-      if (allowAutoDisconnect != _allowAutoDisconnect) {
-        update = true;
-        _allowAutoDisconnect = allowAutoDisconnect;
-      }
-
-      final autoDisconnectTimeout =
-          await bind.mainGetOption(key: kOptionAutoDisconnectTimeout);
-      if (autoDisconnectTimeout != _autoDisconnectTimeout) {
-        update = true;
-        _autoDisconnectTimeout = autoDisconnectTimeout;
-      }
-
       if (update) {
         setState(() {});
       }
-    }();
+    });
   }
 
   @override
@@ -227,6 +243,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     Provider.of<FfiModel>(context);
     final outgoingOnly = bind.isOutgoingOnly();
+    final incommingOnly = bind.isIncomingOnly();
     final customClientSection = CustomSettingsSection(
         child: Column(
       children: [
@@ -242,18 +259,76 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       ],
     ));
     final List<AbstractSettingsTile> enhancementsTiles = [];
-    final List<AbstractSettingsTile> shareScreenTiles = [
+    final enable2fa = bind.mainHasValid2FaSync();
+    final List<AbstractSettingsTile> tfaTiles = [
       SettingsTile.switchTile(
         title: Text(translate('enable-2fa-title')),
-        initialValue: bind.mainHasValid2FaSync(),
-        onToggle: (_) async {
+        initialValue: enable2fa,
+        onToggle: (v) async {
           update() async {
             setState(() {});
           }
 
-          change2fa(callback: update);
+          if (v == false) {
+            CommonConfirmDialog(
+                gFFI.dialogManager, translate('cancel-2fa-confirm-tip'), () {
+              change2fa(callback: update);
+            });
+          } else {
+            change2fa(callback: update);
+          }
         },
       ),
+      if (enable2fa)
+        SettingsTile.switchTile(
+          title: Text(translate('Telegram bot')),
+          initialValue: bind.mainHasValidBotSync(),
+          onToggle: (v) async {
+            update() async {
+              setState(() {});
+            }
+
+            if (v == false) {
+              CommonConfirmDialog(
+                  gFFI.dialogManager, translate('cancel-bot-confirm-tip'), () {
+                changeBot(callback: update);
+              });
+            } else {
+              changeBot(callback: update);
+            }
+          },
+        ),
+      if (enable2fa)
+        SettingsTile.switchTile(
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(translate('Enable trusted devices')),
+              Text('* ${translate('enable-trusted-devices-tip')}',
+                  style: Theme.of(context).textTheme.bodySmall),
+            ],
+          ),
+          initialValue: _enableTrustedDevices,
+          onToggle: isOptionFixed(kOptionEnableTrustedDevices)
+              ? null
+              : (v) async {
+                  mainSetBoolOption(kOptionEnableTrustedDevices, v);
+                  setState(() {
+                    _enableTrustedDevices = v;
+                  });
+                },
+        ),
+      if (enable2fa && _enableTrustedDevices)
+        SettingsTile(
+            title: Text(translate('Manage trusted devices')),
+            trailing: Icon(Icons.arrow_forward_ios),
+            onPressed: (context) {
+              Navigator.push(context, MaterialPageRoute(builder: (context) {
+                return _ManageTrustedDevices();
+              }));
+            })
+    ];
+    final List<AbstractSettingsTile> shareScreenTiles = [
       SettingsTile.switchTile(
         title: Text(translate('Deny LAN discovery')),
         initialValue: _denyLANDiscovery,
@@ -282,9 +357,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         initialValue: _onlyWhiteList,
         onToggle: (_) async {
           update() async {
-            final onlyWhiteList =
-                (await bind.mainGetOption(key: kOptionWhitelist)) !=
-                    defaultOptionWhitelist;
+            final onlyWhiteList = whitelistNotEmpty();
             if (onlyWhiteList != _onlyWhiteList) {
               setState(() {
                 _onlyWhiteList = onlyWhiteList;
@@ -301,10 +374,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         onToggle: isOptionFixed(kOptionEnableAbr)
             ? null
             : (v) async {
-                await bind.mainSetOption(
-                    key: kOptionEnableAbr, value: v ? defaultOptionYes : "N");
-                final newValue =
-                    await bind.mainGetOption(key: kOptionEnableAbr) != "N";
+                await mainSetBoolOption(kOptionEnableAbr, v);
+                final newValue = await mainGetBoolOption(kOptionEnableAbr);
                 setState(() {
                   _enableAbr = newValue;
                 });
@@ -316,12 +387,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         onToggle: isOptionFixed(kOptionEnableRecordSession)
             ? null
             : (v) async {
-                await bind.mainSetOption(
-                    key: kOptionEnableRecordSession,
-                    value: v ? defaultOptionYes : "N");
+                await mainSetBoolOption(kOptionEnableRecordSession, v);
                 final newValue =
-                    await bind.mainGetOption(key: kOptionEnableRecordSession) !=
-                        "N";
+                    await mainGetBoolOption(kOptionEnableRecordSession);
                 setState(() {
                   _enableRecordSession = newValue;
                 });
@@ -493,7 +561,75 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           gFFI.invokeMethod(AndroidChannel.kSetStartOnBootOpt, toValue);
         }));
 
+    if (!bind.isCustomClient()) {
+      enhancementsTiles.add(
+        SettingsTile.switchTile(
+          initialValue: _checkUpdateOnStartup,
+          title:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(translate('Check for software update on startup')),
+          ]),
+          onToggle: (bool toValue) async {
+            await mainSetLocalBoolOption(kOptionEnableCheckUpdate, toValue);
+            setState(() => _checkUpdateOnStartup = toValue);
+          },
+        ),
+      );
+    }
+
+    onFloatingWindowChanged(bool toValue) async {
+      if (toValue) {
+        if (!await AndroidPermissionManager.check(kSystemAlertWindow)) {
+          if (!await AndroidPermissionManager.request(kSystemAlertWindow)) {
+            return;
+          }
+        }
+      }
+      final disable = !toValue;
+      bind.mainSetLocalOption(
+          key: kOptionDisableFloatingWindow,
+          value: disable ? 'Y' : defaultOptionNo);
+      setState(() => _floatingWindowDisabled = disable);
+      gFFI.serverModel.androidUpdatekeepScreenOn();
+    }
+
+    enhancementsTiles.add(SettingsTile.switchTile(
+        initialValue: !_floatingWindowDisabled,
+        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(translate('Floating window')),
+          Text('* ${translate('floating_window_tip')}',
+              style: Theme.of(context).textTheme.bodySmall),
+        ]),
+        onToggle: bind.mainIsOptionFixed(key: kOptionDisableFloatingWindow)
+            ? null
+            : onFloatingWindowChanged));
+
+    enhancementsTiles.add(_getPopupDialogRadioEntry(
+      title: 'Keep screen on',
+      list: [
+        _RadioEntry('Never', _keepScreenOnToOption(KeepScreenOn.never)),
+        _RadioEntry('During controlled',
+            _keepScreenOnToOption(KeepScreenOn.duringControlled)),
+        _RadioEntry('During service is on',
+            _keepScreenOnToOption(KeepScreenOn.serviceOn)),
+      ],
+      getter: () => _keepScreenOnToOption(_floatingWindowDisabled
+          ? KeepScreenOn.never
+          : optionToKeepScreenOn(
+              bind.mainGetLocalOption(key: kOptionKeepScreenOn))),
+      asyncSetter: isOptionFixed(kOptionKeepScreenOn) || _floatingWindowDisabled
+          ? null
+          : (value) async {
+              await bind.mainSetLocalOption(
+                  key: kOptionKeepScreenOn, value: value);
+              setState(() => _keepScreenOn = optionToKeepScreenOn(value));
+              gFFI.serverModel.androidUpdatekeepScreenOn();
+            },
+    ));
+
     final disabledSettings = bind.isDisableSettings();
+    final hideSecuritySettings =
+        bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) == 'Y';
     final settings = SettingsList(
       sections: [
         customClientSection,
@@ -517,12 +653,19 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             ],
           ),
         SettingsSection(title: Text(translate("Settings")), tiles: [
-          if (!disabledSettings)
+          if (!disabledSettings && !_hideNetwork && !_hideServer)
             SettingsTile(
                 title: Text(translate('ID/Relay Server')),
                 leading: Icon(Icons.cloud),
                 onPressed: (context) {
                   showServerSettings(gFFI.dialogManager);
+                }),
+          if (!isIOS && !_hideNetwork && !_hideProxy)
+            SettingsTile(
+                title: Text(translate('Socks5/Http(s) Proxy')),
+                leading: Icon(Icons.network_ping),
+                onPressed: (context) {
+                  changeSocks5Proxy();
                 }),
           SettingsTile(
               title: Text(translate('Language')),
@@ -533,8 +676,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           SettingsTile(
             title: Text(translate(
                 Theme.of(context).brightness == Brightness.light
-                    ? 'Dark Theme'
-                    : 'Light Theme')),
+                    ? 'Light Theme'
+                    : 'Dark Theme')),
             leading: Icon(Theme.of(context).brightness == Brightness.light
                 ? Icons.dark_mode
                 : Icons.light_mode),
@@ -551,57 +694,85 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               onToggle: isOptionFixed(kOptionEnableHwcodec)
                   ? null
                   : (v) async {
-                      await bind.mainSetOption(
-                          key: kOptionEnableHwcodec,
-                          value: v ? defaultOptionYes : "N");
+                      await mainSetBoolOption(kOptionEnableHwcodec, v);
                       final newValue =
-                          await bind.mainGetOption(key: kOptionEnableHwcodec) !=
-                              "N";
+                          await mainGetBoolOption(kOptionEnableHwcodec);
                       setState(() {
                         _enableHardwareCodec = newValue;
                       });
                     },
             ),
           ]),
-        if (isAndroid && !outgoingOnly)
+        if (isAndroid)
           SettingsSection(
             title: Text(translate("Recording")),
             tiles: [
-              SettingsTile.switchTile(
-                title:
-                    Text(translate('Automatically record incoming sessions')),
-                leading: Icon(Icons.videocam),
-                description: FutureBuilder(
-                    builder: (ctx, data) => Offstage(
-                        offstage: !data.hasData,
-                        child: Text("${translate("Directory")}: ${data.data}")),
-                    future: bind.mainVideoSaveDirectory(root: false)),
-                initialValue: _autoRecordIncomingSession,
-                onToggle: isOptionFixed(kOptionAllowAutoRecordIncoming)
-                    ? null
-                    : (v) async {
-                        await bind.mainSetOption(
-                            key: kOptionAllowAutoRecordIncoming,
-                            value:
-                                bool2option(kOptionAllowAutoRecordIncoming, v));
-                        final newValue = option2bool(
-                            kOptionAllowAutoRecordIncoming,
-                            await bind.mainGetOption(
-                                key: kOptionAllowAutoRecordIncoming));
-                        setState(() {
-                          _autoRecordIncomingSession = newValue;
-                        });
-                      },
+              if (!outgoingOnly)
+                SettingsTile.switchTile(
+                  title:
+                      Text(translate('Automatically record incoming sessions')),
+                  initialValue: _autoRecordIncomingSession,
+                  onToggle: isOptionFixed(kOptionAllowAutoRecordIncoming)
+                      ? null
+                      : (v) async {
+                          await bind.mainSetOption(
+                              key: kOptionAllowAutoRecordIncoming,
+                              value: bool2option(
+                                  kOptionAllowAutoRecordIncoming, v));
+                          final newValue = option2bool(
+                              kOptionAllowAutoRecordIncoming,
+                              await bind.mainGetOption(
+                                  key: kOptionAllowAutoRecordIncoming));
+                          setState(() {
+                            _autoRecordIncomingSession = newValue;
+                          });
+                        },
+                ),
+              if (!incommingOnly)
+                SettingsTile.switchTile(
+                  title:
+                      Text(translate('Automatically record outgoing sessions')),
+                  initialValue: _autoRecordOutgoingSession,
+                  onToggle: isOptionFixed(kOptionAllowAutoRecordOutgoing)
+                      ? null
+                      : (v) async {
+                          await bind.mainSetLocalOption(
+                              key: kOptionAllowAutoRecordOutgoing,
+                              value: bool2option(
+                                  kOptionAllowAutoRecordOutgoing, v));
+                          final newValue = option2bool(
+                              kOptionAllowAutoRecordOutgoing,
+                              bind.mainGetLocalOption(
+                                  key: kOptionAllowAutoRecordOutgoing));
+                          setState(() {
+                            _autoRecordOutgoingSession = newValue;
+                          });
+                        },
+                ),
+              SettingsTile(
+                title: Text(translate("Directory")),
+                description: Text(bind.mainVideoSaveDirectory(root: false)),
               ),
             ],
           ),
-        if (isAndroid && !disabledSettings && !outgoingOnly)
+        if (isAndroid &&
+            !disabledSettings &&
+            !outgoingOnly &&
+            !hideSecuritySettings)
+          SettingsSection(title: Text('2FA'), tiles: tfaTiles),
+        if (isAndroid &&
+            !disabledSettings &&
+            !outgoingOnly &&
+            !hideSecuritySettings)
           SettingsSection(
             title: Text(translate("Share Screen")),
             tiles: shareScreenTiles,
           ),
         if (!bind.isIncomingOnly()) defaultDisplaySection(),
-        if (isAndroid && !disabledSettings && !outgoingOnly)
+        if (isAndroid &&
+            !disabledSettings &&
+            !outgoingOnly &&
+            !hideSecuritySettings)
           SettingsSection(
             title: Text(translate("Enhancements")),
             tiles: enhancementsTiles,
@@ -611,9 +782,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           tiles: [
             SettingsTile(
                 onPressed: (context) async {
-                  if (await canLaunchUrl(Uri.parse(url))) {
-                    await launchUrl(Uri.parse(url));
-                  }
+                  await launchUrl(Uri.parse(url));
                 },
                 title: Text(translate("Version: ") + version),
                 value: Padding(
@@ -680,11 +849,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       ],
     );
   }
-}
-
-void showServerSettings(OverlayDialogManager dialogManager) async {
-  Map<String, dynamic> options = jsonDecode(await bind.mainGetOptions());
-  showServerSettingsWithValue(ServerConfig.fromOptions(options), dialogManager);
 }
 
 void showLanguageSettings(OverlayDialogManager dialogManager) async {
@@ -756,15 +920,13 @@ void showThemeSettings(OverlayDialogManager dialogManager) async {
 void showAbout(OverlayDialogManager dialogManager) {
   dialogManager.show((setState, close, context) {
     return CustomAlertDialog(
-      title: Text('${translate('About')} RustDesk'),
+      title: Text(translate('About RustDesk')),
       content: Wrap(direction: Axis.vertical, spacing: 12, children: [
         Text('Version: $version'),
         InkWell(
             onTap: () async {
               const url = 'https://rustdesk.com/';
-              if (await canLaunchUrl(Uri.parse(url))) {
-                await launchUrl(Uri.parse(url));
-              }
+              await launchUrl(Uri.parse(url));
             },
             child: Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
@@ -910,6 +1072,51 @@ class __DisplayPageState extends State<_DisplayPage> {
   }
 }
 
+class _ManageTrustedDevices extends StatefulWidget {
+  const _ManageTrustedDevices();
+
+  @override
+  State<_ManageTrustedDevices> createState() => __ManageTrustedDevicesState();
+}
+
+class __ManageTrustedDevicesState extends State<_ManageTrustedDevices> {
+  RxList<TrustedDevice> trustedDevices = RxList.empty(growable: true);
+  RxList<Uint8List> selectedDevices = RxList.empty();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(translate('Manage trusted devices')),
+        centerTitle: true,
+        actions: [
+          Obx(() => IconButton(
+              icon: Icon(Icons.delete, color: Colors.white),
+              onPressed: selectedDevices.isEmpty
+                  ? null
+                  : () {
+                      confrimDeleteTrustedDevicesDialog(
+                          trustedDevices, selectedDevices);
+                    }))
+        ],
+      ),
+      body: FutureBuilder(
+          future: TrustedDevice.get(),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return Center(child: CircularProgressIndicator());
+            }
+            if (snapshot.hasError) {
+              return Center(child: Text('Error: ${snapshot.error}'));
+            }
+            final devices = snapshot.data as List<TrustedDevice>;
+            trustedDevices = devices.obs;
+            return trustedDevicesTable(trustedDevices, selectedDevices);
+          }),
+    );
+  }
+}
+
 class _RadioEntry {
   final String label;
   final String value;
@@ -919,7 +1126,7 @@ class _RadioEntry {
 typedef _RadioEntryGetter = String Function();
 typedef _RadioEntrySetter = Future<void> Function(String);
 
-_getPopupDialogRadioEntry({
+SettingsTile _getPopupDialogRadioEntry({
   required String title,
   required List<_RadioEntry> list,
   required _RadioEntryGetter getter,
@@ -973,7 +1180,7 @@ _getPopupDialogRadioEntry({
 
   return SettingsTile(
     title: Text(translate(title)),
-    onPressed: (context) => showDialog(),
+    onPressed: asyncSetter == null ? null : (context) => showDialog(),
     value: Padding(
       padding: EdgeInsets.symmetric(vertical: 8),
       child: Obx(() => Text(translate(valueText.value))),

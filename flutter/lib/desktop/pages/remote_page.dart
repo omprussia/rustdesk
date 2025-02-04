@@ -6,7 +6,6 @@ import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'package:flutter_improved_scrolling/flutter_improved_scrolling.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 
 import '../../consts.dart';
@@ -45,7 +44,9 @@ class RemotePage extends StatefulWidget {
     this.switchUuid,
     this.forceRelay,
     this.isSharedPassword,
-  }) : super(key: key);
+  }) : super(key: key) {
+    initSharedStates(id);
+  }
 
   final String id;
   final SessionID? sessionId;
@@ -64,7 +65,7 @@ class RemotePage extends StatefulWidget {
 
   @override
   State<RemotePage> createState() {
-    final state = _RemotePageState();
+    final state = _RemotePageState(id);
     _lastState.value = state;
     return state;
   }
@@ -85,14 +86,20 @@ class _RemotePageState extends State<RemotePage>
 
   final FocusNode _rawKeyFocusNode = FocusNode(debugLabel: "rawkeyFocusNode");
 
+  // We need `_instanceIdOnEnterOrLeaveImage4Toolbar` together with `_onEnterOrLeaveImage4Toolbar`
+  // to identify the toolbar instance and its callback function.
+  int? _instanceIdOnEnterOrLeaveImage4Toolbar;
   Function(bool)? _onEnterOrLeaveImage4Toolbar;
 
   late FFI _ffi;
 
   SessionID get sessionId => _ffi.sessionId;
 
+  _RemotePageState(String id) {
+    _initStates(id);
+  }
+
   void _initStates(String id) {
-    initSharedStates(id);
     _zoomCursor = PeerBoolOption.find(id, kOptionZoomCursor);
     _showRemoteCursor = ShowRemoteCursorState.find(id);
     _keyboardEnabled = KeyboardEnabledState.find(id);
@@ -102,12 +109,13 @@ class _RemotePageState extends State<RemotePage>
   @override
   void initState() {
     super.initState();
-    _initStates(widget.id);
     _ffi = FFI(widget.sessionId);
-    Get.put(_ffi, tag: widget.id);
+    Get.put<FFI>(_ffi, tag: widget.id);
     _ffi.imageModel.addCallbackOnFirstImage((String peerId) {
       showKBLayoutTypeChooserIfNeeded(
           _ffi.ffiModel.pi.platform, _ffi.dialogManager);
+      _ffi.recordingModel
+          .updateStatus(bind.sessionGetIsRecording(sessionId: _ffi.sessionId));
     });
     _ffi.start(
       widget.id,
@@ -131,11 +139,14 @@ class _RemotePageState extends State<RemotePage>
     _ffi.ffiModel.updateEventListener(sessionId, widget.id);
     if (!isWeb) bind.pluginSyncUi(syncTo: kAppTypeDesktopRemote);
     _ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
-    // Session option should be set after models.dart/FFI.start
-    _showRemoteCursor.value = bind.sessionGetToggleOptionSync(
-        sessionId: sessionId, arg: 'show-remote-cursor');
-    _zoomCursor.value = bind.sessionGetToggleOptionSync(
-        sessionId: sessionId, arg: kOptionZoomCursor);
+    _ffi.dialogManager.loadMobileActionsOverlayVisible();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // Session option should be set after models.dart/FFI.start
+      _showRemoteCursor.value = bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: 'show-remote-cursor');
+      _zoomCursor.value = bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: kOptionZoomCursor);
+    });
     DesktopMultiWindow.addListener(this);
     // if (!_isCustomCursorInited) {
     //   customCursorController.registerNeedUpdateCursorCallback(
@@ -150,7 +161,10 @@ class _RemotePageState extends State<RemotePage>
     // }
 
     _blockableOverlayState.applyFfi(_ffi);
-    widget.tabController?.onSelected?.call(widget.id);
+    // Call onSelected in post frame callback, since we cannot guarantee that the callback will not call setState.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.tabController?.onSelected?.call(widget.id);
+    });
   }
 
   @override
@@ -232,13 +246,14 @@ class _RemotePageState extends State<RemotePage>
     super.dispose();
     debugPrint("REMOTE PAGE dispose session $sessionId ${widget.id}");
     _ffi.textureModel.onRemotePageDispose(closeSession);
-    // ensure we leave this session, this is a double check
-    _ffi.inputModel.enterOrLeave(false);
+    if (closeSession) {
+      // ensure we leave this session, this is a double check
+      _ffi.inputModel.enterOrLeave(false);
+    }
     DesktopMultiWindow.removeListener(this);
     _ffi.dialogManager.hideMobileActionsOverlay();
     _ffi.imageModel.disposeImage();
     _ffi.cursorModel.disposeImages();
-    _ffi.recordingModel.onClose();
     _rawKeyFocusNode.dispose();
     await _ffi.close(closeSession: closeSession);
     _timer?.cancel();
@@ -268,9 +283,18 @@ class _RemotePageState extends State<RemotePage>
           id: widget.id,
           ffi: _ffi,
           state: widget.toolbarState,
-          onEnterOrLeaveImageSetter: (func) =>
-              _onEnterOrLeaveImage4Toolbar = func,
-          onEnterOrLeaveImageCleaner: () => _onEnterOrLeaveImage4Toolbar = null,
+          onEnterOrLeaveImageSetter: (id, func) {
+            _instanceIdOnEnterOrLeaveImage4Toolbar = id;
+            _onEnterOrLeaveImage4Toolbar = func;
+          },
+          onEnterOrLeaveImageCleaner: (id) {
+            // If _instanceIdOnEnterOrLeaveImage4Toolbar != id
+            // it means `_onEnterOrLeaveImage4Toolbar` is not set or it has been changed to another toolbar.
+            if (_instanceIdOnEnterOrLeaveImage4Toolbar == id) {
+              _instanceIdOnEnterOrLeaveImage4Toolbar = null;
+              _onEnterOrLeaveImage4Toolbar = null;
+            }
+          },
           setRemoteState: setState,
         );
 
@@ -307,8 +331,21 @@ class _RemotePageState extends State<RemotePage>
                       _ffi.ffiModel.waitForFirstImage.isTrue
                   ? emptyOverlay()
                   : () {
-                      _ffi.ffiModel.tryShowAndroidActionsOverlay();
-                      return Offstage();
+                      if (!_ffi.ffiModel.isPeerAndroid) {
+                        return Offstage();
+                      } else {
+                        return Obx(() => Offstage(
+                              offstage: _ffi.dialogManager
+                                  .mobileActionsOverlayVisible.isFalse,
+                              child: Overlay(initialEntries: [
+                                makeMobileActionsOverlayEntry(
+                                  () => _ffi.dialogManager
+                                      .setMobileActionsOverlayVisible(false),
+                                  ffi: _ffi,
+                                )
+                              ]),
+                            ));
+                      }
                     }(),
               // Use Overlay to enable rebuild every time on menu button click.
               _ffi.ffiModel.pi.isSet.isTrue
@@ -462,6 +499,7 @@ class _RemotePageState extends State<RemotePage>
           () => _ffi.ffiModel.pi.isSet.isFalse
               ? Container(color: Colors.transparent)
               : Obx(() {
+                  widget.toolbarState.initShow(sessionId);
                   _ffi.textureModel.updateCurrentDisplay(peerDisplay.value);
                   return ImagePaint(
                     id: widget.id,
@@ -479,12 +517,13 @@ class _RemotePageState extends State<RemotePage>
     ];
 
     if (!_ffi.canvasModel.cursorEmbedded) {
-      paints.add(Obx(() => Offstage(
-          offstage: _showRemoteCursor.isFalse || _remoteCursorMoved.isFalse,
-          child: CursorPaint(
-            id: widget.id,
-            zoomCursor: _zoomCursor,
-          ))));
+      paints
+          .add(Obx(() => _showRemoteCursor.isFalse || _remoteCursorMoved.isFalse
+              ? Offstage()
+              : CursorPaint(
+                  id: widget.id,
+                  zoomCursor: _zoomCursor,
+                )));
     }
     paints.add(
       Positioned(
@@ -536,11 +575,6 @@ class _ImagePaintState extends State<ImagePaint> {
   RxBool get keyboardEnabled => widget.keyboardEnabled;
   RxBool get remoteCursorMoved => widget.remoteCursorMoved;
   Widget Function(Widget)? get listenerBuilder => widget.listenerBuilder;
-
-  @override
-  void initState() {
-    super.initState();
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -595,10 +629,11 @@ class _ImagePaintState extends State<ImagePaint> {
       final paintWidth = c.getDisplayWidth() * s;
       final paintHeight = c.getDisplayHeight() * s;
       final paintSize = Size(paintWidth, paintHeight);
-      final paintWidget = m.useTextureRender
-          ? _BuildPaintTextureRender(
-              c, s, Offset.zero, paintSize, isViewOriginal())
-          : _buildScrollbarNonTextureRender(m, paintSize, s);
+      final paintWidget =
+          m.useTextureRender || widget.ffi.ffiModel.pi.forceTextureRender
+              ? _BuildPaintTextureRender(
+                  c, s, Offset.zero, paintSize, isViewOriginal())
+              : _buildScrollbarNonTextureRender(m, paintSize, s);
       return NotificationListener<ScrollNotification>(
           onNotification: (notification) {
             c.updateScrollPercent();
@@ -616,17 +651,18 @@ class _ImagePaintState extends State<ImagePaint> {
           ));
     } else {
       if (c.size.width > 0 && c.size.height > 0) {
-        final paintWidget = m.useTextureRender
-            ? _BuildPaintTextureRender(
-                c,
-                s,
-                Offset(
-                  isLinux ? c.x.toInt().toDouble() : c.x,
-                  isLinux ? c.y.toInt().toDouble() : c.y,
-                ),
-                c.size,
-                isViewOriginal())
-            : _buildScrollAuthNonTextureRender(m, c, s);
+        final paintWidget =
+            m.useTextureRender || widget.ffi.ffiModel.pi.forceTextureRender
+                ? _BuildPaintTextureRender(
+                    c,
+                    s,
+                    Offset(
+                      isLinux ? c.x.toInt().toDouble() : c.x,
+                      isLinux ? c.y.toInt().toDouble() : c.y,
+                    ),
+                    c.size,
+                    isViewOriginal())
+                : _buildScrollAutoNonTextureRender(m, c, s);
         return mouseRegion(child: _buildListener(paintWidget));
       } else {
         return Container();
@@ -642,7 +678,7 @@ class _ImagePaintState extends State<ImagePaint> {
     );
   }
 
-  Widget _buildScrollAuthNonTextureRender(
+  Widget _buildScrollAutoNonTextureRender(
       ImageModel m, CanvasModel c, double s) {
     return CustomPaint(
       size: Size(c.size.width, c.size.height),
@@ -705,12 +741,6 @@ class _ImagePaintState extends State<ImagePaint> {
     ScrollController horizontal,
     ScrollController vertical,
   ) {
-    final scrollConfig = CustomMouseWheelScrollConfig(
-        scrollDuration: kDefaultScrollDuration,
-        scrollCurve: Curves.linearToEaseOut,
-        mouseWheelTurnsThrottleTimeMs:
-            kDefaultMouseWheelThrottleDuration.inMilliseconds,
-        scrollAmountMultiplier: kDefaultScrollAmountMultiplier);
     var widget = child;
     if (layoutSize.width < size.width) {
       widget = ScrollConfiguration(
@@ -756,36 +786,26 @@ class _ImagePaintState extends State<ImagePaint> {
       );
     }
     if (layoutSize.width < size.width) {
-      widget = ImprovedScrolling(
-        scrollController: horizontal,
-        enableCustomMouseWheelScrolling: cursorOverImage.isFalse,
-        customMouseWheelScrollConfig: scrollConfig,
-        child: RawScrollbar(
-          thickness: kScrollbarThickness,
-          thumbColor: Colors.grey,
-          controller: horizontal,
-          thumbVisibility: false,
-          trackVisibility: false,
-          notificationPredicate: layoutSize.height < size.height
-              ? (notification) => notification.depth == 1
-              : defaultScrollNotificationPredicate,
-          child: widget,
-        ),
+      widget = RawScrollbar(
+        thickness: kScrollbarThickness,
+        thumbColor: Colors.grey,
+        controller: horizontal,
+        thumbVisibility: false,
+        trackVisibility: false,
+        notificationPredicate: layoutSize.height < size.height
+            ? (notification) => notification.depth == 1
+            : defaultScrollNotificationPredicate,
+        child: widget,
       );
     }
     if (layoutSize.height < size.height) {
-      widget = ImprovedScrolling(
-        scrollController: vertical,
-        enableCustomMouseWheelScrolling: cursorOverImage.isFalse,
-        customMouseWheelScrollConfig: scrollConfig,
-        child: RawScrollbar(
-          thickness: kScrollbarThickness,
-          thumbColor: Colors.grey,
-          controller: vertical,
-          thumbVisibility: false,
-          trackVisibility: false,
-          child: widget,
-        ),
+      widget = RawScrollbar(
+        thickness: kScrollbarThickness,
+        thumbColor: Colors.grey,
+        controller: vertical,
+        thumbVisibility: false,
+        trackVisibility: false,
+        child: widget,
       );
     }
 

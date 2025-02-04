@@ -32,6 +32,7 @@ const String kPeerPlatformWindows = "Windows";
 const String kPeerPlatformLinux = "Linux";
 const String kPeerPlatformMacOS = "Mac OS";
 const String kPeerPlatformAndroid = "Android";
+const String kPeerPlatformWebDesktop = "WebDesktop";
 
 const double kScrollbarThickness = 12.0;
 
@@ -88,6 +89,7 @@ const String kOptionAllowAutoDisconnect = "allow-auto-disconnect";
 const String kOptionAutoDisconnectTimeout = "auto-disconnect-timeout";
 const String kOptionEnableHwcodec = "enable-hwcodec";
 const String kOptionAllowAutoRecordIncoming = "allow-auto-record-incoming";
+const String kOptionAllowAutoRecordOutgoing = "allow-auto-record-outgoing";
 const String kOptionVideoSaveDirectory = "video-save-directory";
 const String kOptionAccessMode = "access-mode";
 const String kOptionEnableKeyboard = "enable-keyboard";
@@ -133,8 +135,28 @@ const String kOptionAllowAlwaysSoftwareRender = "allow-always-software-render";
 const String kOptionEnableCheckUpdate = "enable-check-update";
 const String kOptionAllowLinuxHeadless = "allow-linux-headless";
 const String kOptionAllowRemoveWallpaper = "allow-remove-wallpaper";
+const String kOptionStopService = "stop-service";
+const String kOptionDirectxCapture = "enable-directx-capture";
+const String kOptionAllowRemoteCmModification = "allow-remote-cm-modification";
+const String kOptionEnableTrustedDevices = "enable-trusted-devices";
+
+// buildin opitons
+const String kOptionHideServerSetting = "hide-server-settings";
+const String kOptionHideProxySetting = "hide-proxy-settings";
+const String kOptionHideSecuritySetting = "hide-security-settings";
+const String kOptionHideNetworkSetting = "hide-network-settings";
+const String kOptionRemovePresetPasswordWarning =
+    "remove-preset-password-warning";
+const kHideUsernameOnCard = "hide-username-on-card";
+const String kOptionHideHelpCards = "hide-help-cards";
 
 const String kOptionToggleViewOnly = "view-only";
+
+const String kOptionDisableFloatingWindow = "disable-floating-window";
+
+const String kOptionKeepScreenOn = "keep-screen-on";
+
+const String kOptionShowMobileAction = "showMobileActions";
 
 const String kUrlActionClose = "close";
 
@@ -146,6 +168,15 @@ const int kWindowMainId = 0;
 
 const String kPointerEventKindTouch = "touch";
 const String kPointerEventKindMouse = "mouse";
+
+const String kMouseEventTypeDefault = "";
+const String kMouseEventTypePanStart = "pan_start";
+const String kMouseEventTypePanUpdate = "pan_update";
+const String kMouseEventTypePanEnd = "pan_end";
+const String kMouseEventTypeDown = "down";
+const String kMouseEventTypeUp = "up";
+
+const String kKeyFlutterKey = "flutter_key";
 
 const String kKeyShowDisplaysAsIndividualWindows =
     'displays_as_individual_windows';
@@ -213,15 +244,11 @@ const double kDesktopIconButtonSplashRadius = 20;
 /// [kMinCursorSize] indicates min cursor (w, h)
 const int kMinCursorSize = 12;
 
-/// [kDefaultScrollAmountMultiplier] indicates how many rows can be scrolled after a minimum scroll action of mouse
-const kDefaultScrollAmountMultiplier = 5.0;
-const kDefaultScrollDuration = Duration(milliseconds: 50);
-const kDefaultMouseWheelThrottleDuration = Duration(milliseconds: 50);
 const kFullScreenEdgeSize = 0.0;
 const kMaximizeEdgeSize = 0.0;
-// Do not use kWindowEdgeSize directly. Use `windowEdgeSize` in `common.dart` instead.
-final kWindowEdgeSize = isWindows ? 1.0 : 5.0;
-final kWindowBorderWidth = 1.0;
+// Do not use kWindowResizeEdgeSize directly. Use `windowResizeEdgeSize` in `common.dart` instead.
+const kWindowResizeEdgeSize = 5.0;
+const kWindowBorderWidth = 1.0;
 const kDesktopMenuPadding = EdgeInsets.only(left: 12.0, right: 3.0);
 const kFrameBorderRadius = 12.0;
 const kFrameClipRRectBorderRadius = 12.0;
@@ -547,3 +574,5 @@ enum WindowsTarget {
 extension WindowsTargetExt on int {
   WindowsTarget get windowsVersion => getWindowsTarget(this);
 }
+
+const kCheckSoftwareUpdateFinish = 'check_software_update_finish';

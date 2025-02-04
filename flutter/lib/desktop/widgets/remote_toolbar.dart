@@ -26,45 +26,42 @@ import './popup_menu.dart';
 import './kb_layout_type_chooser.dart';
 
 class ToolbarState {
-  late RxBool show;
   late RxBool _pin;
 
+  bool isShowInited = false;
+  RxBool show = false.obs;
+
   ToolbarState() {
+    _pin = RxBool(false);
     final s = bind.getLocalFlutterOption(k: kOptionRemoteMenubarState);
     if (s.isEmpty) {
-      _initSet(false, false);
       return;
     }
 
     try {
       final m = jsonDecode(s);
-      if (m == null) {
-        _initSet(false, false);
-      } else {
-        _initSet(m['pin'] ?? false, m['pin'] ?? false);
+      if (m != null) {
+        _pin = RxBool(m['pin'] ?? false);
       }
     } catch (e) {
       debugPrint('Failed to decode toolbar state ${e.toString()}');
-      _initSet(false, false);
     }
-  }
-
-  _initSet(bool s, bool p) {
-    // Show remubar when connection is established.
-    show = RxBool(
-        bind.mainGetUserDefaultOption(key: kOptionCollapseToolbar) != 'Y');
-    _pin = RxBool(p);
   }
 
   bool get pin => _pin.value;
 
-  switchShow() async {
+  switchShow(SessionID sessionId) async {
+    bind.sessionToggleOption(
+        sessionId: sessionId, value: kOptionCollapseToolbar);
     show.value = !show.value;
   }
 
-  setShow(bool v) async {
-    if (show.value != v) {
-      show.value = v;
+  initShow(SessionID sessionId) async {
+    if (!isShowInited) {
+      show.value = !(await bind.sessionGetToggleOption(
+              sessionId: sessionId, arg: kOptionCollapseToolbar) ??
+          false);
+      isShowInited = true;
     }
   }
 
@@ -85,10 +82,6 @@ class ToolbarState {
   _savePin() async {
     bind.setLocalFlutterOption(
         k: kOptionRemoteMenubarState, v: jsonEncode({'pin': _pin.value}));
-  }
-
-  save() async {
-    await _savePin();
   }
 }
 
@@ -312,7 +305,7 @@ class RemoteMenuEntry {
   }) {
     return MenuEntryButton<String>(
       childBuilder: (TextStyle? style) => Text(
-        '${translate("Insert")} Ctrl + Alt + Del',
+        translate("Insert Ctrl + Alt + Del"),
         style: style,
       ),
       proc: () {
@@ -332,8 +325,8 @@ class RemoteToolbar extends StatefulWidget {
   final String id;
   final FFI ffi;
   final ToolbarState state;
-  final Function(Function(bool)) onEnterOrLeaveImageSetter;
-  final VoidCallback onEnterOrLeaveImageCleaner;
+  final Function(int, Function(bool)) onEnterOrLeaveImageSetter;
+  final Function(int) onEnterOrLeaveImageCleaner;
   final Function(VoidCallback) setRemoteState;
 
   RemoteToolbar({
@@ -379,7 +372,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
   initState() {
     super.initState();
 
-    Future.delayed(Duration.zero, () async {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       _fractionX.value = double.tryParse(await bind.sessionGetOption(
                   sessionId: widget.ffi.sessionId,
                   arg: 'remote-menubar-drag-x') ??
@@ -393,7 +386,7 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       initialValue: 0,
     );
 
-    widget.onEnterOrLeaveImageSetter((enter) {
+    widget.onEnterOrLeaveImageSetter(identityHashCode(this), (enter) {
       if (enter) {
         triggerAutoHide();
         _isCursorOverImage = true;
@@ -413,12 +406,11 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
   dispose() {
     super.dispose();
 
-    widget.onEnterOrLeaveImageCleaner();
+    widget.onEnterOrLeaveImageCleaner(identityHashCode(this));
   }
 
   @override
   Widget build(BuildContext context) {
-    // No need to use future builder here.
     return Align(
       alignment: Alignment.topCenter,
       child: Obx(() => show.value
@@ -444,10 +436,11 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
             shadowColor: MyTheme.color(context).shadow,
             borderRadius: borderRadius,
             child: _DraggableShowHide(
+              id: widget.id,
               sessionId: widget.ffi.sessionId,
               dragging: _dragging,
               fractionX: _fractionX,
-              show: show,
+              toolbarState: widget.state,
               setFullscreen: _setFullscreen,
               setMinimize: _minimize,
               borderRadius: borderRadius,
@@ -460,8 +453,8 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
 
   Widget _buildToolbar(BuildContext context) {
     final List<Widget> toolbarItems = [];
+    toolbarItems.add(_PinMenu(state: widget.state));
     if (!isWebDesktop) {
-      toolbarItems.add(_PinMenu(state: widget.state));
       toolbarItems.add(_MobileActionMenu(ffi: widget.ffi));
     }
 
@@ -486,8 +479,8 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       setFullscreen: _setFullscreen,
     ));
     toolbarItems.add(_KeyboardMenu(id: widget.id, ffi: widget.ffi));
+    toolbarItems.add(_ChatMenu(id: widget.id, ffi: widget.ffi));
     if (!isWeb) {
-      toolbarItems.add(_ChatMenu(id: widget.id, ffi: widget.ffi));
       toolbarItems.add(_VoiceCallMenu(id: widget.id, ffi: widget.ffi));
     }
     if (!isWeb) toolbarItems.add(_RecordMenu());
@@ -587,8 +580,8 @@ class _MobileActionMenu extends StatelessWidget {
     return Obx(() => _IconMenuButton(
           assetName: 'assets/actions_mobile.svg',
           tooltip: 'Mobile Actions',
-          onPressed: () =>
-              ffi.dialogManager.toggleMobileActionsOverlay(ffi: ffi),
+          onPressed: () => ffi.dialogManager.setMobileActionsOverlayVisible(
+              !ffi.dialogManager.mobileActionsOverlayVisible.value),
           color: ffi.dialogManager.mobileActionsOverlayVisible.isTrue
               ? _ToolbarTheme.blueColor
               : _ToolbarTheme.inactiveColor,
@@ -643,15 +636,12 @@ class _MonitorMenu extends StatelessWidget {
   }
 
   Widget buildMonitorSubmenuWidget(BuildContext context) {
-    final m = Provider.of<ImageModel>(context);
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         Row(children: buildMonitorList(context, false)),
-        supportIndividualWindows && m.useTextureRender ? Divider() : Offstage(),
-        supportIndividualWindows && m.useTextureRender
-            ? chooseDisplayBehavior()
-            : Offstage(),
+        supportIndividualWindows ? Divider() : Offstage(),
+        supportIndividualWindows ? chooseDisplayBehavior() : Offstage(),
       ],
     );
   }
@@ -665,7 +655,7 @@ class _MonitorMenu extends StatelessWidget {
         onChanged: (value) async {
           if (value == null) return;
           await bind.sessionSetDisplaysAsIndividualWindows(
-              sessionId: ffi.sessionId, value: value ? 'Y' : '');
+              sessionId: ffi.sessionId, value: value ? 'Y' : 'N');
         },
         ffi: ffi,
         child: Text(translate('Show displays as individual windows')));
@@ -737,10 +727,7 @@ class _MonitorMenu extends StatelessWidget {
     for (int i = 0; i < pi.displays.length; i++) {
       monitorList.add(buildMonitorButton(i));
     }
-    final m = Provider.of<ImageModel>(context);
-    if (supportIndividualWindows &&
-        m.useTextureRender &&
-        pi.displays.length > 1) {
+    if (supportIndividualWindows && pi.displays.length > 1) {
       monitorList.add(buildMonitorButton(kAllDisplayValue));
     }
     return monitorList;
@@ -824,7 +811,6 @@ class _MonitorMenu extends StatelessWidget {
     RxInt display = CurrentDisplayState.find(id);
     if (display.value != i) {
       final isChooseDisplayToOpenInNewWindow = pi.isSupportMultiDisplay &&
-          bind.mainGetUseTextureRender() &&
           bind.sessionGetDisplaysAsIndividualWindows(
                   sessionId: ffi.sessionId) ==
               'Y';
@@ -1048,11 +1034,6 @@ class _DisplayMenuState extends State<_DisplayMenu> {
   String get id => widget.id;
 
   @override
-  void initState() {
-    super.initState();
-  }
-
-  @override
   Widget build(BuildContext context) {
     _screenAdjustor.updateScreen();
     menuChildrenGetter() {
@@ -1067,15 +1048,11 @@ class _DisplayMenuState extends State<_DisplayMenu> {
           ffi: widget.ffi,
           screenAdjustor: _screenAdjustor,
         ),
-        if (pi.isRustDeskIdd)
-          _RustDeskVirtualDisplayMenu(
-            id: widget.id,
+        if (showVirtualDisplayMenu(ffi))
+          _SubmenuButton(
             ffi: widget.ffi,
-          ),
-        if (pi.isAmyuniIdd)
-          _AmyuniVirtualDisplayMenu(
-            id: widget.id,
-            ffi: widget.ffi,
+            menuChildren: getVirtualDisplayMenuChildren(ffi, id, null),
+            child: Text(translate("Virtual display")),
           ),
         cursorToggles(),
         Divider(),
@@ -1297,7 +1274,9 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
   @override
   void initState() {
     super.initState();
-    _getLocalResolutionWayland();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _getLocalResolutionWayland();
+    });
   }
 
   Rect? scaledRect() {
@@ -1516,7 +1495,7 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
     );
   }
 
-  TextField _resolutionInput(TextEditingController controller) {
+  Widget _resolutionInput(TextEditingController controller) {
     return TextField(
       decoration: InputDecoration(
         border: InputBorder.none,
@@ -1530,7 +1509,7 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
         FilteringTextInputFormatter.allow(RegExp(r'[0-9]')),
       ],
       controller: controller,
-    );
+    ).workaroundFreezeLinuxMint();
   }
 
   List<Widget> _supportedResolutionMenuButtons() => resolutions
@@ -1574,155 +1553,6 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
   }
 }
 
-class _RustDeskVirtualDisplayMenu extends StatefulWidget {
-  final String id;
-  final FFI ffi;
-
-  _RustDeskVirtualDisplayMenu({
-    Key? key,
-    required this.id,
-    required this.ffi,
-  }) : super(key: key);
-
-  @override
-  State<_RustDeskVirtualDisplayMenu> createState() =>
-      _RustDeskVirtualDisplayMenuState();
-}
-
-class _RustDeskVirtualDisplayMenuState
-    extends State<_RustDeskVirtualDisplayMenu> {
-  @override
-  void initState() {
-    super.initState();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (widget.ffi.ffiModel.pi.platform != kPeerPlatformWindows) {
-      return Offstage();
-    }
-    if (!widget.ffi.ffiModel.pi.isInstalled) {
-      return Offstage();
-    }
-
-    final virtualDisplays = widget.ffi.ffiModel.pi.RustDeskVirtualDisplays;
-    final privacyModeState = PrivacyModeState.find(widget.id);
-
-    final children = <Widget>[];
-    for (var i = 0; i < kMaxVirtualDisplayCount; i++) {
-      children.add(Obx(() => CkbMenuButton(
-            value: virtualDisplays.contains(i + 1),
-            onChanged: privacyModeState.isNotEmpty
-                ? null
-                : (bool? value) async {
-                    if (value != null) {
-                      bind.sessionToggleVirtualDisplay(
-                          sessionId: widget.ffi.sessionId,
-                          index: i + 1,
-                          on: value);
-                    }
-                  },
-            child: Text('${translate('Virtual display')} ${i + 1}'),
-            ffi: widget.ffi,
-          )));
-    }
-    children.add(Divider());
-    children.add(Obx(() => MenuButton(
-          onPressed: privacyModeState.isNotEmpty
-              ? null
-              : () {
-                  bind.sessionToggleVirtualDisplay(
-                      sessionId: widget.ffi.sessionId,
-                      index: kAllVirtualDisplay,
-                      on: false);
-                },
-          ffi: widget.ffi,
-          child: Text(translate('Plug out all')),
-        )));
-    return _SubmenuButton(
-      ffi: widget.ffi,
-      menuChildren: children,
-      child: Text(translate("Virtual display")),
-    );
-  }
-}
-
-class _AmyuniVirtualDisplayMenu extends StatefulWidget {
-  final String id;
-  final FFI ffi;
-
-  _AmyuniVirtualDisplayMenu({
-    Key? key,
-    required this.id,
-    required this.ffi,
-  }) : super(key: key);
-
-  @override
-  State<_AmyuniVirtualDisplayMenu> createState() =>
-      _AmiyuniVirtualDisplayMenuState();
-}
-
-class _AmiyuniVirtualDisplayMenuState extends State<_AmyuniVirtualDisplayMenu> {
-  @override
-  void initState() {
-    super.initState();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (widget.ffi.ffiModel.pi.platform != kPeerPlatformWindows) {
-      return Offstage();
-    }
-    if (!widget.ffi.ffiModel.pi.isInstalled) {
-      return Offstage();
-    }
-
-    final count = widget.ffi.ffiModel.pi.amyuniVirtualDisplayCount;
-    final privacyModeState = PrivacyModeState.find(widget.id);
-
-    final children = <Widget>[
-      Obx(() => Row(
-            children: [
-              TextButton(
-                onPressed: privacyModeState.isNotEmpty || count == 0
-                    ? null
-                    : () => bind.sessionToggleVirtualDisplay(
-                        sessionId: widget.ffi.sessionId, index: 0, on: false),
-                child: Icon(Icons.remove),
-              ),
-              Text(count.toString()),
-              TextButton(
-                onPressed: privacyModeState.isNotEmpty || count == 4
-                    ? null
-                    : () => bind.sessionToggleVirtualDisplay(
-                        sessionId: widget.ffi.sessionId, index: 0, on: true),
-                child: Icon(Icons.add),
-              ),
-            ],
-          )),
-      Divider(),
-      Obx(() => MenuButton(
-            onPressed: privacyModeState.isNotEmpty || count == 0
-                ? null
-                : () {
-                    bind.sessionToggleVirtualDisplay(
-                        sessionId: widget.ffi.sessionId,
-                        index: kAllVirtualDisplay,
-                        on: false);
-                  },
-            ffi: widget.ffi,
-            child: Text(translate('Plug out all')),
-          )),
-    ];
-
-    return _SubmenuButton(
-      ffi: widget.ffi,
-      menuChildren: children,
-      child: Text(translate("Virtual display")),
-    );
-  }
-}
-
 class _KeyboardMenu extends StatelessWidget {
   final String id;
   final FFI ffi;
@@ -1756,6 +1586,7 @@ class _KeyboardMenu extends StatelessWidget {
               viewMode(),
               Divider(),
               ...toolbarToggles(),
+              ...mobileActions(),
             ]);
   }
 
@@ -1782,7 +1613,9 @@ class _KeyboardMenu extends StatelessWidget {
       // If use flutter to grab keys, we can only use one mode.
       // Map mode and Legacy mode, at least one of them is supported.
       String? modeOnly;
-      if (isInputSourceFlutter) {
+      // Keep both map and legacy mode on web at the moment.
+      // TODO: Remove legacy mode after web supports translate mode on web.
+      if (isInputSourceFlutter && isDesktop) {
         if (bind.sessionIsKeyboardModeSupported(
             sessionId: ffi.sessionId, mode: kKeyMapMode)) {
           modeOnly = kKeyMapMode;
@@ -1886,11 +1719,46 @@ class _KeyboardMenu extends StatelessWidget {
                 if (value == null) return;
                 await bind.sessionToggleOption(
                     sessionId: ffi.sessionId, value: kOptionToggleViewOnly);
-                ffiModel.setViewOnly(id, value);
+                final viewOnly = await bind.sessionGetToggleOption(
+                    sessionId: ffi.sessionId, arg: kOptionToggleViewOnly);
+                ffiModel.setViewOnly(id, viewOnly ?? value);
               }
             : null,
         ffi: ffi,
         child: Text(translate('View Mode')));
+  }
+
+  mobileActions() {
+    if (pi.platform != kPeerPlatformAndroid) return [];
+    final enabled = versionCmp(pi.version, '1.2.7') >= 0;
+    if (!enabled) return [];
+    return [
+      Divider(),
+      MenuButton(
+          child: Text(translate('Back')),
+          onPressed: () => ffi.inputModel.onMobileBack(),
+          ffi: ffi),
+      MenuButton(
+          child: Text(translate('Home')),
+          onPressed: () => ffi.inputModel.onMobileHome(),
+          ffi: ffi),
+      MenuButton(
+          child: Text(translate('Apps')),
+          onPressed: () => ffi.inputModel.onMobileApps(),
+          ffi: ffi),
+      MenuButton(
+          child: Text(translate('Volume up')),
+          onPressed: () => ffi.inputModel.onMobileVolumeUp(),
+          ffi: ffi),
+      MenuButton(
+          child: Text(translate('Volume down')),
+          onPressed: () => ffi.inputModel.onMobileVolumeDown(),
+          ffi: ffi),
+      MenuButton(
+          child: Text(translate('Power')),
+          onPressed: () => ffi.inputModel.onMobilePower(),
+          ffi: ffi),
+    ];
   }
 }
 
@@ -1913,34 +1781,49 @@ class _ChatMenuState extends State<_ChatMenu> {
 
   @override
   Widget build(BuildContext context) {
-    return _IconSubmenuButton(
-        tooltip: 'Chat',
-        key: chatButtonKey,
-        svg: 'assets/chat.svg',
-        ffi: widget.ffi,
-        color: _ToolbarTheme.blueColor,
-        hoverColor: _ToolbarTheme.hoverBlueColor,
-        menuChildrenGetter: () => [textChat(), voiceCall()]);
+    if (isWeb) {
+      return buildTextChatButton();
+    } else {
+      return _IconSubmenuButton(
+          tooltip: 'Chat',
+          key: chatButtonKey,
+          svg: 'assets/chat.svg',
+          ffi: widget.ffi,
+          color: _ToolbarTheme.blueColor,
+          hoverColor: _ToolbarTheme.hoverBlueColor,
+          menuChildrenGetter: () => [textChat(), voiceCall()]);
+    }
+  }
+
+  buildTextChatButton() {
+    return _IconMenuButton(
+      assetName: 'assets/message_24dp_5F6368.svg',
+      tooltip: 'Text chat',
+      key: chatButtonKey,
+      onPressed: _textChatOnPressed,
+      color: _ToolbarTheme.blueColor,
+      hoverColor: _ToolbarTheme.hoverBlueColor,
+    );
   }
 
   textChat() {
     return MenuButton(
         child: Text(translate('Text chat')),
         ffi: widget.ffi,
-        onPressed: () {
-          RenderBox? renderBox =
-              chatButtonKey.currentContext?.findRenderObject() as RenderBox?;
+        onPressed: _textChatOnPressed);
+  }
 
-          Offset? initPos;
-          if (renderBox != null) {
-            final pos = renderBox.localToGlobal(Offset.zero);
-            initPos = Offset(pos.dx, pos.dy + _ToolbarTheme.dividerHeight);
-          }
-
-          widget.ffi.chatModel.changeCurrentKey(
-              MessageKey(widget.ffi.id, ChatModel.clientModeID));
-          widget.ffi.chatModel.toggleChatOverlay(chatInitPos: initPos);
-        });
+  _textChatOnPressed() {
+    RenderBox? renderBox =
+        chatButtonKey.currentContext?.findRenderObject() as RenderBox?;
+    Offset? initPos;
+    if (renderBox != null) {
+      final pos = renderBox.localToGlobal(Offset.zero);
+      initPos = Offset(pos.dx, pos.dy + _ToolbarTheme.dividerHeight);
+    }
+    widget.ffi.chatModel
+        .changeCurrentKey(MessageKey(widget.ffi.id, ChatModel.clientModeID));
+    widget.ffi.chatModel.toggleChatOverlay(chatInitPos: initPos);
   }
 
   voiceCall() {
@@ -1965,28 +1848,31 @@ class _VoiceCallMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     menuChildrenGetter() {
-      final audioInput =
-          AudioInput(builder: (devices, currentDevice, setDevice) {
-        return Column(
-          children: devices
-              .map((d) => RdoMenuButton<String>(
-                    child: Container(
-                      child: Text(
-                        d,
-                        overflow: TextOverflow.ellipsis,
+      final audioInput = AudioInput(
+        builder: (devices, currentDevice, setDevice) {
+          return Column(
+            children: devices
+                .map((d) => RdoMenuButton<String>(
+                      child: Container(
+                        child: Text(
+                          d,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        constraints: BoxConstraints(maxWidth: 250),
                       ),
-                      constraints: BoxConstraints(maxWidth: 250),
-                    ),
-                    value: d,
-                    groupValue: currentDevice,
-                    onChanged: (v) {
-                      if (v != null) setDevice(v);
-                    },
-                    ffi: ffi,
-                  ))
-              .toList(),
-        );
-      });
+                      value: d,
+                      groupValue: currentDevice,
+                      onChanged: (v) {
+                        if (v != null) setDevice(v);
+                      },
+                      ffi: ffi,
+                    ))
+                .toList(),
+          );
+        },
+        isCm: false,
+        isVoiceCall: true,
+      );
       return [
         audioInput,
         Divider(),
@@ -2038,8 +1924,7 @@ class _RecordMenu extends StatelessWidget {
     var ffi = Provider.of<FfiModel>(context);
     var recordingModel = Provider.of<RecordingModel>(context);
     final visible =
-        (recordingModel.start || ffi.permissions['recording'] != false) &&
-            ffi.pi.currentDisplay != kAllDisplayValue;
+        (recordingModel.start || ffi.permissions['recording'] != false);
     if (!visible) return Offstage();
     return _IconMenuButton(
       assetName: 'assets/rec.svg',
@@ -2348,10 +2233,11 @@ class RdoMenuButton<T> extends StatelessWidget {
 }
 
 class _DraggableShowHide extends StatefulWidget {
+  final String id;
   final SessionID sessionId;
   final RxDouble fractionX;
   final RxBool dragging;
-  final RxBool show;
+  final ToolbarState toolbarState;
   final BorderRadius borderRadius;
 
   final Function(bool) setFullscreen;
@@ -2359,10 +2245,11 @@ class _DraggableShowHide extends StatefulWidget {
 
   const _DraggableShowHide({
     Key? key,
+    required this.id,
     required this.sessionId,
     required this.fractionX,
     required this.dragging,
-    required this.show,
+    required this.toolbarState,
     required this.setFullscreen,
     required this.setMinimize,
     required this.borderRadius,
@@ -2377,6 +2264,8 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
   Size size = Size.zero;
   double left = 0.0;
   double right = 1.0;
+
+  RxBool get show => widget.toolbarState.show;
 
   @override
   initState() {
@@ -2446,15 +2335,33 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
     );
     final isFullscreen = stateGlobal.fullscreen;
     const double iconSize = 20;
+
+    buttonWrapper(VoidCallback? onPressed, Widget child,
+        {Color hoverColor = _ToolbarTheme.blueColor}) {
+      final bgColor = buttonStyle.backgroundColor?.resolve({});
+      return TextButton(
+        onPressed: onPressed,
+        child: child,
+        style: buttonStyle.copyWith(
+          backgroundColor: MaterialStateProperty.resolveWith((states) {
+            if (states.contains(MaterialState.hovered)) {
+              return (bgColor ?? hoverColor).withOpacity(0.15);
+            }
+            return bgColor;
+          }),
+        ),
+      );
+    }
+
     final child = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         _buildDraggable(context),
-        Obx(() => TextButton(
-              onPressed: () {
+        Obx(() => buttonWrapper(
+              () {
                 widget.setFullscreen(!isFullscreen.value);
               },
-              child: Tooltip(
+              Tooltip(
                 message: translate(
                     isFullscreen.isTrue ? 'Exit Fullscreen' : 'Fullscreen'),
                 child: Icon(
@@ -2465,32 +2372,52 @@ class _DraggableShowHideState extends State<_DraggableShowHide> {
                 ),
               ),
             )),
-        Obx(() => Offstage(
-              offstage: isFullscreen.isFalse,
-              child: TextButton(
-                onPressed: () => widget.setMinimize(),
-                child: Tooltip(
-                  message: translate('Minimize'),
-                  child: Icon(
-                    Icons.remove,
-                    size: iconSize,
+        if (!isMacOS && !isWebDesktop)
+          Obx(() => Offstage(
+                offstage: isFullscreen.isFalse,
+                child: buttonWrapper(
+                  widget.setMinimize,
+                  Tooltip(
+                    message: translate('Minimize'),
+                    child: Icon(
+                      Icons.remove,
+                      size: iconSize,
+                    ),
                   ),
                 ),
-              ),
-            )),
-        TextButton(
-          onPressed: () => setState(() {
-            widget.show.value = !widget.show.value;
+              )),
+        buttonWrapper(
+          () => setState(() {
+            widget.toolbarState.switchShow(widget.sessionId);
           }),
-          child: Obx((() => Tooltip(
-                message: translate(
-                    widget.show.isTrue ? 'Hide Toolbar' : 'Show Toolbar'),
+          Obx((() => Tooltip(
+                message:
+                    translate(show.isTrue ? 'Hide Toolbar' : 'Show Toolbar'),
                 child: Icon(
-                  widget.show.isTrue ? Icons.expand_less : Icons.expand_more,
+                  show.isTrue ? Icons.expand_less : Icons.expand_more,
                   size: iconSize,
                 ),
               ))),
         ),
+        if (isWebDesktop)
+          Obx(() {
+            if (show.isTrue) {
+              return Offstage();
+            } else {
+              return buttonWrapper(
+                () => closeConnection(id: widget.id),
+                Tooltip(
+                  message: translate('Close'),
+                  child: Icon(
+                    Icons.close,
+                    size: iconSize,
+                    color: _ToolbarTheme.redColor,
+                  ),
+                ),
+                hoverColor: _ToolbarTheme.redColor,
+              ).paddingOnly(left: iconSize / 2);
+            }
+          })
       ],
     );
     return TextButtonTheme(

@@ -34,6 +34,7 @@ class _PortForwardTabPageState extends State<PortForwardTabPage> {
       WindowController.fromWindowId(windowId())
           .setTitle(getWindowNameWithId(id));
     };
+    tabController.onRemoved = (_, id) => onRemoveId(id);
     tabController.add(TabInfo(
         key: params['id'],
         label: params['id'],
@@ -47,14 +48,13 @@ class _PortForwardTabPageState extends State<PortForwardTabPage> {
           tabController: tabController,
           isRDP: isRDP,
           forceRelay: params['forceRelay'],
+          connToken: params['connToken'],
         )));
   }
 
   @override
   void initState() {
     super.initState();
-
-    tabController.onRemoved = (_, id) => onRemoveId(id);
 
     rustDeskWinManager.setMethodHandler((call, fromWindowId) async {
       debugPrint(
@@ -83,6 +83,7 @@ class _PortForwardTabPageState extends State<PortForwardTabPage> {
               isRDP: isRDP,
               tabController: tabController,
               forceRelay: args['forceRelay'],
+              connToken: args['connToken'],
             )));
       } else if (call.method == "onDestroy") {
         tabController.clear();
@@ -106,6 +107,7 @@ class _PortForwardTabPageState extends State<PortForwardTabPage> {
           return true;
         },
         tail: AddButton(),
+        selectedBorderColor: MyTheme.accent,
         labelGetter: DesktopTab.tablabelGetter,
       ),
     );
@@ -127,6 +129,7 @@ class _PortForwardTabPageState extends State<PortForwardTabPage> {
             () => SubWindowDragToResizeArea(
               child: tabWidget,
               resizeEdgeSize: stateGlobal.resizeEdgeSize.value,
+              enableResizeEdges: subWindowManagerEnableResizeEdges,
               windowId: stateGlobal.windowId,
             ),
           );

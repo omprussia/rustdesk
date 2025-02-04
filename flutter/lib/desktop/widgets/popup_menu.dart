@@ -38,18 +38,16 @@ class PopupMenuChildrenItem<T> extends mod_menu.PopupMenuEntry<T> {
 
   @override
   MyPopupMenuItemState<T, PopupMenuChildrenItem<T>> createState() =>
-      MyPopupMenuItemState<T, PopupMenuChildrenItem<T>>();
+      MyPopupMenuItemState<T, PopupMenuChildrenItem<T>>(enabled?.value);
 }
 
 class MyPopupMenuItemState<T, W extends PopupMenuChildrenItem<T>>
     extends State<W> {
   RxBool enabled = true.obs;
 
-  @override
-  void initState() {
-    super.initState();
-    if (widget.enabled != null) {
-      enabled.value = widget.enabled!.value;
+  MyPopupMenuItemState(bool? e) {
+    if (e != null) {
+      enabled.value = e;
     }
   }
 
@@ -65,7 +63,7 @@ class MyPopupMenuItemState<T, W extends PopupMenuChildrenItem<T>>
     final PopupMenuThemeData popupMenuTheme = PopupMenuTheme.of(context);
     TextStyle style = widget.textStyle ??
         popupMenuTheme.textStyle ??
-        theme.textTheme.subtitle1!;
+        theme.textTheme.titleMedium!;
     return Obx(() => mod_menu.PopupMenuButton<T>(
           enabled: enabled.value,
           position: widget.position,

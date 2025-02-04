@@ -1,4 +1,5 @@
 use super::*;
+use crate::common::SimpleCallOnReturn;
 #[cfg(target_os = "linux")]
 use crate::platform::linux::is_x11;
 #[cfg(windows)]
@@ -7,6 +8,7 @@ use crate::virtual_display_manager;
 use hbb_common::get_version_number;
 use hbb_common::protobuf::MessageField;
 use scrap::Display;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // https://github.com/rustdesk/rustdesk/discussions/6042, avoiding dbus call
 
@@ -29,6 +31,9 @@ lazy_static::lazy_static! {
     static ref SYNC_DISPLAYS: Arc<Mutex<SyncDisplaysInfo>> = Default::default();
 }
 
+// https://github.com/rustdesk/rustdesk/pull/8537
+static TEMP_IGNORE_DISPLAYS_CHANGED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Default)]
 struct SyncDisplaysInfo {
     displays: Vec<DisplayInfo>,
@@ -39,13 +44,17 @@ impl SyncDisplaysInfo {
     fn check_changed(&mut self, displays: Vec<DisplayInfo>) {
         if self.displays.len() != displays.len() {
             self.displays = displays;
-            self.is_synced = false;
+            if !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed) {
+                self.is_synced = false;
+            }
             return;
         }
         for (i, d) in displays.iter().enumerate() {
             if d != &self.displays[i] {
                 self.displays = displays;
-                self.is_synced = false;
+                if !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed) {
+                    self.is_synced = false;
+                }
                 return;
             }
         }
@@ -57,6 +66,21 @@ impl SyncDisplaysInfo {
         }
         self.is_synced = true;
         Some(self.displays.clone())
+    }
+}
+
+pub fn temp_ignore_displays_changed() -> SimpleCallOnReturn {
+    TEMP_IGNORE_DISPLAYS_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+    SimpleCallOnReturn {
+        b: true,
+        f: Box::new(move || {
+            // Wait for a while to make sure check_display_changed() is called
+            // after video service has sending its `SwitchDisplay` message(`try_broadcast_display_changed()`).
+            std::thread::sleep(Duration::from_millis(1000));
+            TEMP_IGNORE_DISPLAYS_CHANGED.store(false, Ordering::Relaxed);
+            // Trigger the display changed message.
+            SYNC_DISPLAYS.lock().unwrap().is_synced = false;
+        }),
     }
 }
 
@@ -184,6 +208,14 @@ fn check_get_displays_changed_msg() -> Option<Message> {
 }
 
 pub fn check_displays_changed() -> ResultType<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // Currently, wayland need to call wayland::clear() before call Display::all(), otherwise it will cause
+        // block, or even crash here, https://github.com/rustdesk/rustdesk/blob/0bb4d43e9ea9d9dfb9c46c8d27d1a97cd0ad6bea/libs/scrap/src/wayland/pipewire.rs#L235
+        if !is_x11() {
+            return Ok(());
+        }
+    }
     check_update_displays(&try_get_displays()?);
     Ok(())
 }
@@ -196,9 +228,11 @@ fn get_displays_msg() -> Option<Message> {
 fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
     while sp.ok() {
         sp.snapshot(|sps| {
-            if sps.has_subscribes() {
-                SYNC_DISPLAYS.lock().unwrap().is_synced = false;
-                bail!("new subscriber");
+            if !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed) {
+                if sps.has_subscribes() {
+                    SYNC_DISPLAYS.lock().unwrap().is_synced = false;
+                    bail!("new subscriber");
+                }
             }
             Ok(())
         })?;
@@ -310,14 +344,18 @@ pub fn is_inited_msg() -> Option<Message> {
     None
 }
 
-pub async fn update_get_sync_displays() -> ResultType<Vec<DisplayInfo>> {
+pub async fn update_get_sync_displays_on_login() -> ResultType<Vec<DisplayInfo>> {
     #[cfg(target_os = "linux")]
     {
         if !is_x11() {
             return super::wayland::get_displays().await;
         }
     }
-    check_update_displays(&try_get_displays()?);
+    #[cfg(not(windows))]
+    let displays = display_service::try_get_displays();
+    #[cfg(windows)]
+    let displays = display_service::try_get_displays_add_amyuni_headless();
+    check_update_displays(&displays?);
     Ok(SYNC_DISPLAYS.lock().unwrap().displays.clone())
 }
 
@@ -394,7 +432,8 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
     let mut displays = Display::all()?;
 
     // Do not add virtual display if the platform is not installed or the virtual display is not supported.
-    if !crate::platform::is_installed() || !virtual_display_manager::is_virtual_display_supported() {
+    if !crate::platform::is_installed() || !virtual_display_manager::is_virtual_display_supported()
+    {
         return Ok(displays);
     }
 
@@ -405,13 +444,25 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
         return Ok(displays);
     }
 
-    // If is switching session, no displays may be detected. But it is not a real case.
-    if displays.is_empty() && crate::platform::desktop_changed() {
-        return Ok(displays);
-    }
+    // The following code causes a bug.
+    // The virtual display cannot be added when there's no session(eg. when exiting from RDP).
+    // Because `crate::platform::desktop_changed()` always returns true at that time.
+    //
+    // The code only solves a rare case:
+    // 1. The control side is connecting.
+    // 2. The windows session is switching, no displays are detected, but they're there.
+    // Then the controlled side plugs in a virtual display for "headless".
+    //
+    // No need to do the following check. But the code is kept here for marking the issue.
+    // If there're someones reporting the issue, we may add a better check by waiting for a while. (switching session).
+    // But I don't think it's good to add the timeout check without any issue.
+    //
+    // If is switching session, no displays may be detected.
+    // if displays.is_empty() && crate::platform::desktop_changed() {
+    //     return Ok(displays);
+    // }
 
     let no_displays_v = no_displays(&displays);
-    virtual_display_manager::set_can_plug_out_all(!no_displays_v);
     if no_displays_v {
         log::debug!("no displays, create virtual display");
         if let Err(e) = virtual_display_manager::plug_in_headless() {

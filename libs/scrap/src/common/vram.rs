@@ -1,11 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::c_void,
     sync::{Arc, Mutex},
 };
 
 use crate::{
-    codec::{base_bitrate, enable_vram_option, EncoderApi, EncoderCfg, Quality},
+    codec::{base_bitrate, enable_vram_option, EncoderApi, EncoderCfg},
+    hwcodec::HwCodecConfig,
     AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
 use hbb_common::{
@@ -16,7 +17,7 @@ use hbb_common::{
     ResultType,
 };
 use hwcodec::{
-    common::{AdapterVendor::*, DataFormat, Driver, MAX_GOP},
+    common::{DataFormat, Driver, MAX_GOP},
     vram::{
         decode::{self, DecodeFrame, Decoder},
         encode::{self, EncodeFrame, Encoder},
@@ -30,6 +31,7 @@ use hwcodec::{
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getadapterluid#remarks
 lazy_static::lazy_static! {
     static ref ENOCDE_NOT_USE: Arc<Mutex<HashMap<usize, bool>>> = Default::default();
+    static ref FALLBACK_GDI_DISPLAYS: Arc<Mutex<HashSet<usize>>> = Default::default();
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +39,7 @@ pub struct VRamEncoderConfig {
     pub device: AdapterDevice,
     pub width: usize,
     pub height: usize,
-    pub quality: Quality,
+    pub quality: f32,
     pub feature: FeatureContext,
     pub keyframe_interval: Option<usize>,
 }
@@ -49,7 +51,6 @@ pub struct VRamEncoder {
     bitrate: u32,
     last_frame_len: usize,
     same_bad_len_counter: usize,
-    config: VRamEncoderConfig,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -59,12 +60,12 @@ impl EncoderApi for VRamEncoder {
     {
         match cfg {
             EncoderCfg::VRAM(config) => {
-                let b = Self::convert_quality(config.quality, &config.feature);
-                let base_bitrate = base_bitrate(config.width as _, config.height as _);
-                let mut bitrate = base_bitrate * b / 100;
-                if base_bitrate <= 0 {
-                    bitrate = base_bitrate;
-                }
+                let bitrate = Self::bitrate(
+                    config.feature.data_format,
+                    config.width,
+                    config.height,
+                    config.quality,
+                );
                 let gop = config.keyframe_interval.unwrap_or(MAX_GOP as _) as i32;
                 let ctx = EncodeContext {
                     f: config.feature.clone(),
@@ -85,7 +86,6 @@ impl EncoderApi for VRamEncoder {
                         bitrate,
                         last_frame_len: 0,
                         same_bad_len_counter: 0,
-                        config,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -97,15 +97,23 @@ impl EncoderApi for VRamEncoder {
     fn encode_to_message(
         &mut self,
         frame: EncodeInput,
-        _ms: i64,
+        ms: i64,
     ) -> ResultType<hbb_common::message_proto::VideoFrame> {
-        let texture = frame.texture()?;
+        let (texture, rotation) = frame.texture()?;
+        if rotation != 0 {
+            // to-do: support rotation
+            // Both the encoder and display(w,h) information need to be changed.
+            bail!("rotation not supported");
+        }
         let mut vf = VideoFrame::new();
         let mut frames = Vec::new();
-        for frame in self.encode(texture).with_context(|| "Failed to encode")? {
+        for frame in self
+            .encode(texture, ms)
+            .with_context(|| "Failed to encode")?
+        {
             frames.push(EncodedVideoFrame {
                 data: Bytes::from(frame.data),
-                pts: frame.pts as _,
+                pts: frame.pts,
                 key: frame.key == 1,
                 ..Default::default()
             });
@@ -162,9 +170,13 @@ impl EncoderApi for VRamEncoder {
         true
     }
 
-    fn set_quality(&mut self, quality: Quality) -> ResultType<()> {
-        let b = Self::convert_quality(quality, &self.ctx.f);
-        let bitrate = base_bitrate(self.ctx.d.width as _, self.ctx.d.height as _) * b / 100;
+    fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
+        let bitrate = Self::bitrate(
+            self.ctx.f.data_format,
+            self.ctx.d.width as _,
+            self.ctx.d.height as _,
+            ratio,
+        );
         if bitrate > 0 {
             if self.encoder.set_bitrate((bitrate) as _).is_ok() {
                 self.bitrate = bitrate;
@@ -177,10 +189,6 @@ impl EncoderApi for VRamEncoder {
         self.bitrate
     }
 
-    fn support_abr(&self) -> bool {
-        self.config.device.vendor_id != ADAPTER_VENDOR_INTEL as u32
-    }
-
     fn support_changing_quality(&self) -> bool {
         true
     }
@@ -191,6 +199,10 @@ impl EncoderApi for VRamEncoder {
 
     fn is_hardware(&self) -> bool {
         true
+    }
+
+    fn disable(&self) {
+        HwCodecConfig::clear(true, true);
     }
 }
 
@@ -212,6 +224,11 @@ impl VRamEncoder {
     }
 
     pub fn available(format: CodecFormat) -> Vec<FeatureContext> {
+        let fallbacks = FALLBACK_GDI_DISPLAYS.lock().unwrap().clone();
+        if !fallbacks.is_empty() {
+            log::info!("fallback gdi displays not empty: {fallbacks:?}");
+            return vec![];
+        }
         let not_use = ENOCDE_NOT_USE.lock().unwrap().clone();
         if not_use.values().any(|not_use| *not_use) {
             log::info!("currently not use vram encoders: {not_use:?}");
@@ -222,9 +239,8 @@ impl VRamEncoder {
             CodecFormat::H265 => DataFormat::H265,
             _ => return vec![],
         };
-        let v: Vec<_> = get_available_config()
-            .map(|c| c.e)
-            .unwrap_or_default()
+        let v: Vec<_> = crate::hwcodec::HwCodecConfig::get()
+            .vram_encode
             .drain(..)
             .filter(|c| c.data_format == data_format)
             .collect();
@@ -256,8 +272,8 @@ impl VRamEncoder {
         }
     }
 
-    pub fn encode(&mut self, texture: *mut c_void) -> ResultType<Vec<EncodeFrame>> {
-        match self.encoder.encode(texture) {
+    pub fn encode(&mut self, texture: *mut c_void, ms: i64) -> ResultType<Vec<EncodeFrame>> {
+        match self.encoder.encode(texture, ms) {
             Ok(v) => {
                 let mut data = Vec::<EncodeFrame>::new();
                 data.append(v);
@@ -267,36 +283,21 @@ impl VRamEncoder {
         }
     }
 
-    pub fn convert_quality(quality: Quality, f: &FeatureContext) -> u32 {
-        match quality {
-            Quality::Best => {
-                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
-                    200
-                } else {
-                    150
-                }
-            }
-            Quality::Balanced => {
-                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
-                    150
-                } else {
-                    100
-                }
-            }
-            Quality::Low => {
-                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
-                    75
-                } else {
-                    50
-                }
-            }
-            Quality::Custom(b) => b,
-        }
+    pub fn bitrate(fmt: DataFormat, width: usize, height: usize, ratio: f32) -> u32 {
+        crate::hwcodec::HwRamEncoder::calc_bitrate(width, height, ratio, fmt == DataFormat::H264)
     }
 
     pub fn set_not_use(display: usize, not_use: bool) {
         log::info!("set display#{display} not use vram encode to {not_use}");
         ENOCDE_NOT_USE.lock().unwrap().insert(display, not_use);
+    }
+
+    pub fn set_fallback_gdi(display: usize, fallback: bool) {
+        if fallback {
+            FALLBACK_GDI_DISPLAYS.lock().unwrap().insert(display);
+        } else {
+            FALLBACK_GDI_DISPLAYS.lock().unwrap().remove(&display);
+        }
     }
 }
 
@@ -325,19 +326,18 @@ impl VRamDecoder {
             CodecFormat::H265 => DataFormat::H265,
             _ => return vec![],
         };
-        get_available_config()
-            .map(|c| c.d)
-            .unwrap_or_default()
+        crate::hwcodec::HwCodecConfig::get()
+            .vram_decode
             .drain(..)
             .filter(|c| c.data_format == data_format && c.luid == luid && luid != 0)
             .collect()
     }
 
     pub fn possible_available_without_check() -> (bool, bool) {
-        if !enable_vram_option() {
+        if !enable_vram_option(false) {
             return (false, false);
         }
-        let v = get_available_config().map(|c| c.d).unwrap_or_default();
+        let v = crate::hwcodec::HwCodecConfig::get().vram_decode;
         (
             v.iter().any(|d| d.data_format == DataFormat::H264),
             v.iter().any(|d| d.data_format == DataFormat::H265),
@@ -350,7 +350,7 @@ impl VRamDecoder {
         match Decoder::new(ctx) {
             Ok(decoder) => Ok(Self { decoder }),
             Err(_) => {
-                hbb_common::config::HwCodecConfig::clear_vram();
+                HwCodecConfig::clear(true, false);
                 Err(anyhow!(format!(
                     "Failed to create decoder, format: {:?}",
                     format
@@ -372,15 +372,7 @@ pub struct VRamDecoderImage<'a> {
 
 impl VRamDecoderImage<'_> {}
 
-fn get_available_config() -> ResultType<Available> {
-    let available = hbb_common::config::HwCodecConfig::load().vram;
-    match Available::deserialize(&available) {
-        Ok(v) => Ok(v),
-        Err(_) => Err(anyhow!("Failed to deserialize:{}", available)),
-    }
-}
-
-pub(crate) fn check_available_vram() -> String {
+pub(crate) fn check_available_vram() -> (Vec<FeatureContext>, Vec<DecodeContext>, String) {
     let d = DynamicContext {
         device: None,
         width: 1280,
@@ -392,8 +384,12 @@ pub(crate) fn check_available_vram() -> String {
     let encoders = encode::available(d);
     let decoders = decode::available();
     let available = Available {
-        e: encoders,
-        d: decoders,
+        e: encoders.clone(),
+        d: decoders.clone(),
     };
-    available.serialize().unwrap_or_default()
+    (
+        encoders,
+        decoders,
+        available.serialize().unwrap_or_default(),
+    )
 }

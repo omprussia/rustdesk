@@ -34,6 +34,7 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
       WindowController.fromWindowId(windowId())
           .setTitle(getWindowNameWithId(id));
     };
+    tabController.onRemoved = (_, id) => onRemoveId(id);
     tabController.add(TabInfo(
         key: params['id'],
         label: params['id'],
@@ -47,6 +48,7 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
           isSharedPassword: params['isSharedPassword'],
           tabController: tabController,
           forceRelay: params['forceRelay'],
+          connToken: params['connToken'],
         )));
   }
 
@@ -54,10 +56,8 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
   void initState() {
     super.initState();
 
-    tabController.onRemoved = (_, id) => onRemoveId(id);
-
     rustDeskWinManager.setMethodHandler((call, fromWindowId) async {
-      print(
+      debugPrint(
           "[FileTransfer] call ${call.method} with args ${call.arguments} from window $fromWindowId to ${windowId()}");
       // for simplify, just replace connectionId
       if (call.method == kWindowEventNewFileTransfer) {
@@ -77,6 +77,7 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
               isSharedPassword: args['isSharedPassword'],
               tabController: tabController,
               forceRelay: args['forceRelay'],
+              connToken: args['connToken'],
             )));
       } else if (call.method == "onDestroy") {
         tabController.clear();
@@ -97,6 +98,7 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
           controller: tabController,
           onWindowCloseButton: handleWindowCloseButton,
           tail: const AddButton(),
+          selectedBorderColor: MyTheme.accent,
           labelGetter: DesktopTab.tablabelGetter,
         ));
     final tabWidget = isLinux
@@ -111,6 +113,7 @@ class _FileManagerTabPageState extends State<FileManagerTabPage> {
         : SubWindowDragToResizeArea(
             child: tabWidget,
             resizeEdgeSize: stateGlobal.resizeEdgeSize.value,
+            enableResizeEdges: subWindowManagerEnableResizeEdges,
             windowId: stateGlobal.windowId,
           );
   }
